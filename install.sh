@@ -3,7 +3,7 @@
 set -e
 
 # Configuration
-REPO_URL="https://github.com/harsh020/mach.git"
+REPO_URL="https://github.com/cognato-ai/mach.git"
 INSTALL_DIR="$HOME/.mach"
 BIN_DIR="$HOME/.local/bin"
 EXE_NAME="mach"
