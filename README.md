@@ -38,13 +38,13 @@ This is the fastest way to get started. It securely sets up an isolated Mach env
 
 ```bash
 # Install Mach globally
-curl -fsSL https://raw.githubusercontent.com/harsh020/mach/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/cognato-ai/mach/master/install.sh | bash
 ```
 To update later, you can just run `mach update`.
 
 To uninstall:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/harsh020/mach/master/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/cognato-ai/mach/master/uninstall.sh | bash
 ```
 
 ### Option 2: via Pipx
