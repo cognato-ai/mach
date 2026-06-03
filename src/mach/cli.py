@@ -782,10 +782,24 @@ def pull_command(args: argparse.Namespace) -> None:
 
 
 def clone_command(args: argparse.Namespace) -> None:
-    source_session_id = args.session_id
+    if args.session_id:
+        repository_name = args.clone_arg
+        source_session_id = args.session_id
+    else:
+        repository_name = None
+        source_session_id = args.clone_arg
+
     store = SessionStore()
     token = _require_auth_token()
-    repository = _require_tracked_repository(store)
+
+    if repository_name:
+        _pull_repository(repository_name)
+        repository = _require_tracked_repository(store)
+    else:
+        # TODO: infer the repository from local Git remotes when multiple tracked
+        # remotes are supported and the backend can resolve ambiguity safely.
+        repository = _require_tracked_repository(store)
+
     session_details = _pull_session_details(store, source_session_id, token)
     mismatches = _repository_mismatches(repository, session_details.repository)
     if mismatches:
@@ -1597,8 +1611,9 @@ def main() -> None:
     pull_parser.add_argument("-s", "--session", help="The ID of the session to check.")
     pull_parser.set_defaults(handler=pull_command, repository=None, repository_name=None, session=None, session_id=None)
 
-    clone_parser = subparsers.add_parser("clone", help="Clone a pulled session into a new local fork.")
-    clone_parser.add_argument("session_id", help="The session ID to clone.")
+    clone_parser = subparsers.add_parser("clone", help="Clone a remote session into a new local fork.")
+    clone_parser.add_argument("clone_arg", metavar="repository_or_session", help="Repository name, or the session ID when a repo is already tracked.")
+    clone_parser.add_argument("session_id", nargs="?", help="The session ID to clone.")
     clone_parser.set_defaults(handler=clone_command)
 
     update_parser = subparsers.add_parser("update", help="Update the global Mach installation to the latest version.")

@@ -83,14 +83,11 @@ mach log
 mach push <session_id>
 ```
 
-To work from a remote session, first trust the repository, then clone the session:
+To work from a remote session, clone it through the repository trust boundary:
 
 ```bash
-# Pull repository metadata and make that repo the local trust boundary
-mach pull --repository my-repo
-
-# Clone an existing session into a new local fork after repository trust is set
-mach clone ses_123
+# Pull repository metadata, validate it, and clone the remote session
+mach clone my-repo ses_123
 
 # Push only the new steps created in your local fork
 mach push <new_session_id>
@@ -149,13 +146,21 @@ mach pull --repository <repository_name>
 
 This validates your auth token, fetches repository details from Mach Web, checks that the pulled repository matches the current Git checkout by name and remote URL when available, then stores the details locally in `.mach/tracked_repo.json`.
 
+This command is useful when you want to validate repository access separately. Most users can let `mach clone <repository_name> <session_id>` do this step automatically.
+
 ### Clone A Remote Session
+
+```bash
+mach clone <repository_name> <session_id>
+```
+
+Clone pulls and validates the repository metadata, verifies that the remote session belongs to that repository, pulls session details, steps, and blobs, then creates a new local fork with a new session ID. The inherited remote steps are marked as already pulled/pushed, so a later `mach push <new_session_id>` uploads only new local steps.
+
+If the repository is already tracked locally, the shorter form also works:
 
 ```bash
 mach clone <session_id>
 ```
-
-Clone validates that the remote session belongs to the tracked repository, pulls session details, steps, and blobs, then creates a new local fork with a new session ID. The inherited remote steps are marked as already pulled/pushed, so a later `mach push <new_session_id>` uploads only new local steps.
 
 ### Push A Session
 
@@ -192,7 +197,7 @@ mach fix --apply
 ### Setup & Configuration
 - `mach init`: Bootstrap the repository, interactively select hooks and stored content types, and start the daemon.
 - `mach pull --repository <repository_name>`: Validate token access, confirm the remote repository matches this Git checkout, and store the tracked repo locally.
-- `mach clone <session_id>`: Validate the session belongs to the tracked repository, pull its step state, fork it locally with a new session ID, and push only new fork steps later.
+- `mach clone <repository_name> <session_id>`: Validate the repository, pull the remote session, fork it locally with a new session ID, and push only new fork steps later.
 - `mach push <session_id>`: Push local session steps and blobs to Mach Web.
 - `mach fix [session_id] --apply`: Normalize session ledgers and rebuild the local index.
 - `mach config show|set`: View or update Mach configuration (e.g. `mach config set --db-enabled false`).
