@@ -51,7 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/cognato-ai/mach/master/uninstall.sh
 If you prefer managing your Python CLIs with [pipx](https://pipx.pypa.io/stable/):
 
 ```bash
-pipx install git+https://github.com/harsh020/mach.git
+pipx install git+https://github.com/cognato-ai/mach.git
 ```
 To update via pipx:
 ```bash
