@@ -2,7 +2,7 @@ from __future__ import annotations
 
 DEFAULT_CONFIG = {
     "enabled": True,
-    "api_base_url": "http://localhost:8000",
+    "api_base_url": "https://api.cognatoai.com",
     "auto_session": True,
     "idle_timeout_sec": None,
     "commit_closes_session": False,
