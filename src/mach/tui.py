@@ -286,6 +286,147 @@ class StepDetail(ModalScreen[None]):
 #  Main App
 # ══════════════════════════════════════════════════════════
 
+class DiffScreen(ModalScreen[None]):
+    BINDINGS = [Binding("escape,q,d", "dismiss", "Close")]
+
+    DEFAULT_CSS = """
+    DiffScreen {
+        align: center middle;
+        background: $background 70%;
+    }
+    #diff-outer {
+        width: 85%;
+        height: 82%;
+        background: $surface;
+        border: round $primary;
+        padding: 0;
+    }
+    #diff-header {
+        height: auto;
+        background: $panel;
+        border-bottom: solid $primary;
+        padding: 1 2;
+    }
+    #diff-body {
+        height: 1fr;
+        padding: 1 2;
+    }
+    #diff-footer-bar {
+        height: 1;
+        background: $panel;
+        border-top: solid $primary;
+        padding: 0 2;
+        content-align: left middle;
+    }
+    """
+
+    def __init__(self, session_id: str, store: SessionStore) -> None:
+        super().__init__()
+        self.session_id = session_id
+        self.store = store
+
+    def compose(self) -> ComposeResult:
+        try:
+            data = self.store.session_diff(self.session_id)
+        except Exception:
+            data = {"meta": {}, "files": [], "files_changed": 0,
+                    "total_added": 0, "total_removed": 0,
+                    "tool_calls": 0, "tool_names": {}}
+
+        meta = data.get("meta") or {}
+        agent = str(meta.get("agent", "unknown"))
+        files = data.get("files") or []
+        files_changed = data.get("files_changed", 0)
+        total_added = data.get("total_added", 0)
+        total_removed = data.get("total_removed", 0)
+        tool_calls = data.get("tool_calls", 0)
+        tool_names = data.get("tool_names") or {}
+        acol = AGENT_COLOR.get(agent.lower(), "white")
+        sid = _short_id(str(meta.get("id", "")), "ses_")
+        branch = str(meta.get("branch", "?"))
+
+        with Vertical(id="diff-outer"):
+            with Container(id="diff-header"):
+                h = Text()
+                h.append("  ⬡ ", style="bold white")
+                h.append("DIFF", style="bold cyan")
+                h.append(f"   {sid}", style="blue")
+                h.append("  agent:", style="dim")
+                h.append(f" {agent}", style=f"bold {acol}")
+                h.append("  on:", style="dim")
+                h.append(f" {branch}", style="cyan")
+                yield Static(h)
+
+            with VerticalScroll(id="diff-body"):
+                if not files:
+                    yield Static(Text("  No file changes recorded in this session.", style="dim"))
+                else:
+                    summary = Text()
+                    summary.append(f"  {files_changed} file(s) changed", style="bold white")
+                    if total_added:
+                        summary.append(f"  +{total_added}", style="green")
+                    if total_removed:
+                        summary.append(f"  -{total_removed}", style="red")
+                    if tool_calls:
+                        summary.append(f"  {tool_calls} tool calls", style="dim yellow")
+                    yield Static(summary)
+                    yield Static(Text(""))
+
+                    top_tools = sorted(tool_names.items(), key=lambda x: -x[1])[:5]
+                    if top_tools:
+                        tools_line = Text()
+                        tools_line.append("  Tools:  ", style="dim")
+                        for i, (name, count) in enumerate(top_tools):
+                            if i > 0:
+                                tools_line.append("  ", style="dim")
+                            tools_line.append(name, style="yellow")
+                            tools_line.append(f"×{count}", style="dim")
+                        yield Static(tools_line)
+                        yield Static(Text(""))
+                        yield Static(Text("  ──", style="dim"))
+
+                    for f in files:
+                        fp = f.get("file_path", "?")
+                        added = f.get("lines_added", 0)
+                        removed = f.get("lines_removed", 0)
+                        is_new = f.get("is_new", False)
+                        tools = f.get("tool_names") or []
+                        fname = fp.split("/")[-1]
+                        dirname = "/".join(fp.split("/")[:-1])
+
+                        line = Text()
+                        line.append("  ", style="dim")
+                        if dirname:
+                            line.append(f"{dirname}/", style="dim")
+                        line.append(fname, style="bold white")
+                        if is_new:
+                            line.append(" (new)", style="green")
+                        elif f.get("action") == "delete":
+                            line.append(" (deleted)", style="red")
+                        if added:
+                            line.append(f" +{added}", style="green")
+                        if removed:
+                            line.append(f" -{removed}", style="red")
+                        if tools:
+                            line.append(f"  ({', '.join(tools)})", style="dim yellow")
+                        yield Static(line)
+
+                        hunks = f.get("hunks") or []
+                        for h in hunks[:8]:
+                            from_line = h.get("from", 0)
+                            to_line = h.get("to", 0)
+                            hl = Text()
+                            hl.append(f"      @@ -{from_line} +{to_line} @@", style="cyan")
+                            yield Static(hl)
+                        if len(hunks) > 8:
+                            yield Static(Text(f"      ... {len(hunks) - 8} more hunk(s)", style="dim"))
+
+            foot = Text()
+            foot.append("  ESC/d ", style="bold yellow")
+            foot.append("close", style="dim")
+            yield Static(foot, id="diff-footer-bar")
+
+
 class MachApp(App):
     TITLE = "mach"
     SUB_TITLE = "execution ledger"
@@ -403,6 +544,7 @@ class MachApp(App):
         Binding("escape,left", "focus_sessions", "← Sessions", show=True),
         Binding("slash", "focus_search", "/ Search", show=True),
         Binding("r", "refresh", "Refresh", show=True),
+        Binding("d", "diff", "Diff", show=True),
     ]
 
     def __init__(self, store: SessionStore) -> None:
@@ -751,6 +893,10 @@ class MachApp(App):
     def action_refresh(self) -> None:
         self._load_sessions()
         self.notify("Sessions refreshed", severity="information", timeout=2)
+
+    def action_diff(self) -> None:
+        if self.selected_session_id:
+            self.push_screen(DiffScreen(self.selected_session_id, self.store))
 
 
 def run_tui(store: SessionStore) -> None:

@@ -22,7 +22,7 @@ from mach.models import PullSessionDetails, RepositoryDetails
 from mach.session import MachError, SessionStore
 from mach.tracker import TrackerService
 
-from mach.ui import render_sessions_list, render_session_steps, render_session_details
+from mach.ui import render_sessions_list, render_session_steps, render_session_details, render_session_diff
 
 STORE_CONTENT_TYPES = list(DEFAULT_CONFIG["store_content"])
 
@@ -1229,6 +1229,15 @@ def show_command(args: argparse.Namespace) -> None:
         pydoc.pager(format_session_details(data, patch=getattr(args, "patch", False)))
 
 
+def diff_command(args: argparse.Namespace) -> None:
+    store = SessionStore()
+    data = store.session_diff(session_id=args.session_id)
+    if getattr(args, "json", False):
+        emit(data)
+    else:
+        print(render_session_diff(data))
+
+
 def verify_command(args: argparse.Namespace) -> None:
     store = SessionStore()
     if args.session_id:
@@ -1257,15 +1266,21 @@ def internal_fix_command(args: argparse.Namespace) -> None:
     print(f"  Sessions changed: {result['sessions_changed']}")
     print(f"  Steps merged: {result['merged_steps']}")
     print(f"  Tool hashes normalized: {result['normalized_tool_hashes']}")
+    print(f"  Linked list fields backfilled: {result['linked_list_fixes']}")
+    print(f"  File changes backfilled: {result['backfilled_file_changes']}")
 
     changed_results = [item for item in result["results"] if item.get("changed")]
     for item in changed_results[:5]:
-        print(
-            f"  {item['session_id']}: "
-            f"{item['before_steps']} -> {item['after_steps']} steps, "
-            f"merged {item['merged_steps']}, "
+        parts = [
+            f"{item['before_steps']} -> {item['after_steps']} steps",
+            f"merged {item['merged_steps']}",
             f"tool hashes {item['normalized_tool_hashes']}"
-        )
+        ]
+        if item.get("linked_list_fixed"):
+            parts.append("backfilled linked list fields")
+        if item.get("backfilled_file_changes"):
+            parts.append(f"backfilled {item['backfilled_file_changes']} file change(s)")
+        print(f"  {item['session_id']}: {', '.join(parts)}")
     if len(changed_results) > 5:
         print(f"  ... {len(changed_results) - 5} more changed session(s)")
 
@@ -1462,6 +1477,11 @@ def main() -> None:
     show_parser.add_argument("--json", action="store_true", help="Output raw JSON.")
     show_parser.add_argument("--patch", "-p", action="store_true", help="Show file changes and hunks.")
     show_parser.set_defaults(handler=show_command)
+
+    diff_parser = subparsers.add_parser("diff", help="Show aggregate file changes for a session.")
+    diff_parser.add_argument("session_id", nargs="?", help="Session ID to diff (default: active session).")
+    diff_parser.add_argument("--json", action="store_true", help="Output raw JSON.")
+    diff_parser.set_defaults(handler=diff_command)
 
     verify_parser = subparsers.add_parser("verify", help="Verify Merkle integrity.")
     verify_parser.add_argument("session_id", nargs="?")
