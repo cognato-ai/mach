@@ -251,6 +251,7 @@ class SessionStore:
         steps = read_jsonl(session_dir / "steps.jsonl")
 
         file_map: dict[str, dict[str, Any]] = {}
+        step_map: dict[str, dict[str, Any]] = {}
         total_added = 0
         total_removed = 0
         tool_calls = 0
@@ -270,11 +271,21 @@ class SessionStore:
                 tool_data = None
 
             for change in step.get("file_changes") or []:
+                step_id = step.get("id", "?")
                 fp = change.get("file_path", "?")
                 action = change.get("action", "write")
                 added = change.get("lines_added") or 0
                 removed = change.get("lines_removed") or 0
                 hunks = change.get("hunks") or []
+                change_entry = {
+                    "file_path": fp,
+                    "action": action,
+                    "lines_added": added,
+                    "lines_removed": removed,
+                    "hunks": hunks,
+                    "is_new": action == "write" and removed == 0 and added > 0,
+                    "diff_source": "recorded" if hunks else "summary",
+                }
 
                 if fp not in file_map:
                     file_map[fp] = {
@@ -307,7 +318,6 @@ class SessionStore:
                     entry["is_new"] = True
 
                 # Track steps that touched this file
-                step_id = step.get("id", "?")
                 if step_id not in entry["step_ids"]:
                     entry["step_ids"].append(step_id)
                 if stype in {"tool", "input", "output", "reasoning"}:
@@ -319,6 +329,29 @@ class SessionStore:
                     }
                     if step_info not in entry["steps"]:
                         entry["steps"].append(step_info)
+
+                if step_id not in step_map:
+                    content = (step.get("tool") or {}).get("content") if stype == "tool" else step.get("content")
+                    step_map[step_id] = {
+                        "step_id": step_id,
+                        "step_type": stype,
+                        "ts": step.get("ts"),
+                        "tool_name": tool_data["name"] if tool_data else None,
+                        "tool_category": tool_data["category"] if tool_data else None,
+                        "content": content,
+                        "files": [],
+                        "files_changed": 0,
+                        "lines_added": 0,
+                        "lines_removed": 0,
+                        "diff_source": "recorded",
+                    }
+                step_entry = step_map[step_id]
+                step_entry["files"].append(change_entry)
+                step_entry["files_changed"] = len({f["file_path"] for f in step_entry["files"]})
+                step_entry["lines_added"] += added
+                step_entry["lines_removed"] += removed
+                if change_entry["diff_source"] != "recorded":
+                    step_entry["diff_source"] = "summary"
 
                 total_added += added
                 total_removed += removed
@@ -342,6 +375,20 @@ class SessionStore:
                 }
                 total_added += added
                 total_removed += removed
+            if file_map:
+                step_map["git_diff"] = {
+                    "step_id": "git_diff",
+                    "step_type": "git",
+                    "ts": None,
+                    "tool_name": None,
+                    "tool_category": None,
+                    "content": "Working tree diff inferred from Git because no recorded file-change steps were found.",
+                    "files": list(file_map.values()),
+                    "files_changed": len(file_map),
+                    "lines_added": total_added,
+                    "lines_removed": total_removed,
+                    "diff_source": "git",
+                }
 
         files = sorted(file_map.values(), key=lambda f: f["file_path"])
         for f in files:
@@ -351,14 +398,27 @@ class SessionStore:
                     f["git_diff"] = git_diff
                     f["diff_source"] = "git"
             f.pop("step_ids", None)
+        steps_changed = sorted(
+            step_map.values(),
+            key=lambda s: (s.get("ts") is None, s.get("ts") or 0, s.get("step_id") or ""),
+        )
+        for step in steps_changed:
+            for f in step.get("files") or []:
+                if not f.get("hunks") and not f.get("git_diff"):
+                    git_diff = self._git_diff_for_file(meta, f["file_path"])
+                    if git_diff:
+                        f["git_diff"] = git_diff
+                        f["diff_source"] = "git"
 
         return {
             "meta": meta,
+            "steps_changed": len(steps_changed),
             "files_changed": len(files),
             "total_added": total_added,
             "total_removed": total_removed,
             "tool_calls": tool_calls,
             "tool_names": tool_names,
+            "steps": steps_changed,
             "files": files,
         }
 
