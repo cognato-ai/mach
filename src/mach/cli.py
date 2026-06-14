@@ -1272,15 +1272,21 @@ def internal_fix_command(args: argparse.Namespace) -> None:
     print(f"  Sessions changed: {result['sessions_changed']}")
     print(f"  Steps merged: {result['merged_steps']}")
     print(f"  Tool hashes normalized: {result['normalized_tool_hashes']}")
+    print(f"  Linked list fields backfilled: {result['linked_list_fixes']}")
+    print(f"  File changes backfilled: {result['backfilled_file_changes']}")
 
     changed_results = [item for item in result["results"] if item.get("changed")]
     for item in changed_results[:5]:
-        print(
-            f"  {item['session_id']}: "
-            f"{item['before_steps']} -> {item['after_steps']} steps, "
-            f"merged {item['merged_steps']}, "
+        parts = [
+            f"{item['before_steps']} -> {item['after_steps']} steps",
+            f"merged {item['merged_steps']}",
             f"tool hashes {item['normalized_tool_hashes']}"
-        )
+        ]
+        if item.get("linked_list_fixed"):
+            parts.append("backfilled linked list fields")
+        if item.get("backfilled_file_changes"):
+            parts.append(f"backfilled {item['backfilled_file_changes']} file change(s)")
+        print(f"  {item['session_id']}: {', '.join(parts)}")
     if len(changed_results) > 5:
         print(f"  ... {len(changed_results) - 5} more changed session(s)")
 
