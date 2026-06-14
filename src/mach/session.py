@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import uuid
 from pathlib import Path
 from time import time
@@ -322,8 +323,33 @@ class SessionStore:
                 total_added += added
                 total_removed += removed
 
+        if not file_map:
+            for item in self._git_diff_name_status(meta):
+                fp = item["file_path"]
+                added, removed = self._git_diff_numstat_for_file(meta, fp)
+                file_map[fp] = {
+                    "file_path": fp,
+                    "action": item["action"],
+                    "lines_added": added,
+                    "lines_removed": removed,
+                    "hunks": [],
+                    "step_ids": [],
+                    "tool_names": [],
+                    "is_new": item["action"] == "write" and item.get("status") == "A",
+                    "steps": [],
+                    "git_diff": self._git_diff_for_file(meta, fp),
+                    "diff_source": "git",
+                }
+                total_added += added
+                total_removed += removed
+
         files = sorted(file_map.values(), key=lambda f: f["file_path"])
         for f in files:
+            if not f.get("hunks") and not f.get("git_diff"):
+                git_diff = self._git_diff_for_file(meta, f["file_path"])
+                if git_diff:
+                    f["git_diff"] = git_diff
+                    f["diff_source"] = "git"
             f.pop("step_ids", None)
 
         return {
@@ -335,6 +361,68 @@ class SessionStore:
             "tool_names": tool_names,
             "files": files,
         }
+
+    def _git_diff_args_for_session(self, meta: dict[str, Any], file_path: str | None = None) -> list[str]:
+        pre_commit = meta.get("pre_commit")
+        post_commit = meta.get("post_commit")
+        args = ["diff"]
+        if pre_commit and post_commit and pre_commit != post_commit:
+            args.extend([str(pre_commit), str(post_commit)])
+        elif pre_commit:
+            args.append(str(pre_commit))
+        if file_path:
+            args.extend(["--", file_path])
+        return args
+
+    def _run_git_capture(self, args: list[str]) -> str:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=self.paths.repo_root,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except OSError:
+            return ""
+        if result.returncode not in (0, 1):
+            return ""
+        return result.stdout
+
+    def _git_diff_for_file(self, meta: dict[str, Any], file_path: str) -> str:
+        return self._run_git_capture(self._git_diff_args_for_session(meta, file_path)).strip()
+
+    def _git_diff_name_status(self, meta: dict[str, Any]) -> list[dict[str, str]]:
+        args = self._git_diff_args_for_session(meta)
+        args.insert(1, "--name-status")
+        output = self._run_git_capture(args)
+        files = []
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            status = parts[0]
+            path = parts[-1] if len(parts) > 1 else ""
+            if not path:
+                continue
+            action = "delete" if status.startswith("D") else "write"
+            files.append({"file_path": path, "action": action, "status": status})
+        return files
+
+    def _git_diff_numstat_for_file(self, meta: dict[str, Any], file_path: str) -> tuple[int, int]:
+        args = self._git_diff_args_for_session(meta, file_path)
+        args.insert(1, "--numstat")
+        output = self._run_git_capture(args)
+        added = 0
+        removed = 0
+        for line in output.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3 or parts[0] == "-" or parts[1] == "-":
+                continue
+            added += int(parts[0])
+            removed += int(parts[1])
+        return added, removed
 
     def list_sessions(self) -> list[dict[str, Any]]:
         self.init_repo()
