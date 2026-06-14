@@ -346,6 +346,103 @@ def render_session_details(data: dict, patch: bool = False) -> str:
     return "\n".join(out)
 
 
+def render_session_diff(data: dict) -> str:
+    meta = data["meta"]
+    files = data["files"]
+    agent = str(meta.get("agent", "unknown"))
+    session_id = str(meta.get("id", ""))
+    branch = str(meta.get("branch", "?"))
+    files_changed = data["files_changed"]
+    total_added = data["total_added"]
+    total_removed = data["total_removed"]
+    tool_calls = data["tool_calls"]
+    tool_names = data.get("tool_names") or {}
+    acol = _agent_color(agent)
+
+    out: list[str] = []
+    out.append("")
+    out.append(_hr("━"))
+    out.append(
+        f"  {C.BOLD}{C.BWHITE}⬡ mach diff{C.RESET}"
+        f"  {C.YELLOW}{session_id.replace('ses_', '')[:16]}{C.RESET}"
+        f"  {acol}{C.BOLD}{agent}{C.RESET}"
+        f"  {C.DIM}on{C.RESET} {C.CYAN}{branch}{C.RESET}"
+    )
+    out.append(_hr("━"))
+    out.append("")
+
+    if not files:
+        out.append(f"  {C.DIM}No file changes recorded in this session.{C.RESET}")
+        out.append("")
+        out.append(_hr())
+        out.append("")
+        return "\n".join(out)
+
+    summary_parts = [f"{C.BOLD}{files_changed}{C.RESET} file(s) changed"]
+    if total_added:
+        summary_parts.append(f"{C.BGREEN}+{total_added}{C.RESET} insertions(+)")
+    if total_removed:
+        summary_parts.append(f"{C.BRED}-{total_removed}{C.RESET} deletions(-)")
+    out.append(f"  {'  '.join(summary_parts)}")
+    if tool_calls:
+        top_tools = sorted(tool_names.items(), key=lambda x: -x[1])[:5]
+        tool_str = "  ".join(f"{C.DIM}{name}{C.RESET}×{count}" for name, count in top_tools)
+        out.append(f"  {C.DIM}tool calls: {tool_str}{C.RESET}")
+    out.append("")
+    out.append(_hr("─"))
+    out.append("")
+
+    for f in files:
+        fp = f["file_path"]
+        added = f.get("lines_added", 0)
+        removed = f.get("lines_removed", 0)
+        is_new = f.get("is_new", False)
+        tools = f.get("tool_names") or []
+        fname = fp.split("/")[-1]
+        dirname = "/".join(fp.split("/")[:-1])
+
+        stats = ""
+        if added:
+            stats += f" {C.BGREEN}+{added}{C.RESET}"
+        if removed:
+            stats += f" {C.BRED}-{removed}{C.RESET}"
+
+        if is_new:
+            badge = f" {C.BGREEN}(new){C.RESET}"
+        elif f.get("action") == "delete":
+            badge = f" {C.BRED}(deleted){C.RESET}"
+        else:
+            badge = ""
+
+        tool_annotation = ""
+        if tools:
+            tool_annotation = f"  {C.DIM}({', '.join(tools)}){C.RESET}"
+
+        dir_prefix = f"{C.DIM}{dirname}/{C.RESET}" if dirname else ""
+        out.append(
+            f"  {C.BOLD}{dir_prefix}{fname}{C.RESET}{badge}{stats}{tool_annotation}"
+        )
+
+        hunks = f.get("hunks") or []
+        if hunks:
+            for h in hunks[:8]:
+                from_line = h.get("from", 0)
+                to_line = h.get("to", 0)
+                out.append(
+                    f"    {C.DIM}@@ -{from_line} +{to_line} @@{C.RESET}"
+                )
+            if len(hunks) > 8:
+                out.append(f"    {C.DIM}... {len(hunks) - 8} more hunk(s){C.RESET}")
+
+    out.append("")
+    out.append(_hr())
+    out.append(
+        f"  {C.DIM}{files_changed} file(s)  ·  +{total_added} -{total_removed}  ·  mach diff <id> --json{C.RESET}"
+    )
+    out.append("")
+    return "\n".join(out)
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------

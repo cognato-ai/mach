@@ -236,6 +236,78 @@ class SessionStore:
     def _is_valid_session_id(self, session_id: str) -> bool:
         return session_id.startswith("ses_") and len(session_id) == 36
 
+    def session_diff(self, session_id: str | None = None) -> dict[str, Any]:
+        self.init_repo()
+        target_id = self.get_active_session_id() if session_id in (None, "HEAD") else session_id
+        if not target_id:
+            raise MachError("No session specified and no active session exists.")
+
+        session_dir = self.paths.sessions_dir / target_id
+        if not session_dir.exists():
+            raise MachError(f"Unknown session: {target_id}")
+
+        meta = self.read_session_meta(target_id)
+        steps = read_jsonl(session_dir / "steps.jsonl")
+
+        file_map: dict[str, dict[str, Any]] = {}
+        total_added = 0
+        total_removed = 0
+        tool_calls = 0
+        tool_names: dict[str, int] = {}
+
+        for step in steps:
+            stype = step.get("type", "")
+            if stype == "tool":
+                tool_calls += 1
+                tool_name = (step.get("tool") or {}).get("name", "unknown")
+                tool_names[tool_name] = tool_names.get(tool_name, 0) + 1
+
+            for change in step.get("file_changes") or []:
+                fp = change.get("file_path", "?")
+                action = change.get("action", "write")
+                added = change.get("lines_added") or 0
+                removed = change.get("lines_removed") or 0
+                hunks = change.get("hunks") or []
+
+                if fp not in file_map:
+                    file_map[fp] = {
+                        "file_path": fp,
+                        "action": action,
+                        "lines_added": 0,
+                        "lines_removed": 0,
+                        "hunks": [],
+                        "tool_names": [],
+                        "is_new": False,
+                    }
+                entry = file_map[fp]
+                if action == "delete":
+                    entry["action"] = "delete"
+                elif entry["action"] != "delete":
+                    entry["action"] = action
+                entry["lines_added"] += added
+                entry["lines_removed"] += removed
+                if hunks:
+                    entry["hunks"].extend(hunks)
+                if stype == "tool" and tool_name not in entry["tool_names"]:
+                    entry["tool_names"].append(tool_name)
+                if action == "write" and entry["lines_removed"] == 0 and added > 0:
+                    entry["is_new"] = True
+
+                total_added += added
+                total_removed += removed
+
+        files = sorted(file_map.values(), key=lambda f: f["file_path"])
+
+        return {
+            "meta": meta,
+            "files_changed": len(files),
+            "total_added": total_added,
+            "total_removed": total_removed,
+            "tool_calls": tool_calls,
+            "tool_names": tool_names,
+            "files": files,
+        }
+
     def list_sessions(self) -> list[dict[str, Any]]:
         self.init_repo()
 

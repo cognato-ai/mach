@@ -22,7 +22,7 @@ from mach.models import PullSessionDetails, RepositoryDetails
 from mach.session import MachError, SessionStore
 from mach.tracker import TrackerService
 
-from mach.ui import render_sessions_list, render_session_steps, render_session_details
+from mach.ui import render_sessions_list, render_session_steps, render_session_details, render_session_diff
 
 STORE_CONTENT_TYPES = list(DEFAULT_CONFIG["store_content"])
 
@@ -1229,6 +1229,21 @@ def show_command(args: argparse.Namespace) -> None:
         pydoc.pager(format_session_details(data, patch=getattr(args, "patch", False)))
 
 
+def diff_command(args: argparse.Namespace) -> None:
+    import sys
+    store = SessionStore()
+    session_id = getattr(args, "session_id", None)
+    if getattr(args, "json", False):
+        data = store.session_diff(session_id=session_id)
+        emit(data)
+    elif sys.stdout.isatty() and not getattr(args, "no_tui", False) and store.get_config().get("use_tui", True):
+        target_id = store.session_diff(session_id=session_id)["meta"].get("id") or session_id
+        from mach.tui import run_diff_tui
+        run_diff_tui(store, session_id=target_id)
+    else:
+        data = store.session_diff(session_id=session_id)
+        print(render_session_diff(data))
+        
 def verify_command(args: argparse.Namespace) -> None:
     store = SessionStore()
     if args.session_id:
@@ -1462,6 +1477,12 @@ def main() -> None:
     show_parser.add_argument("--json", action="store_true", help="Output raw JSON.")
     show_parser.add_argument("--patch", "-p", action="store_true", help="Show file changes and hunks.")
     show_parser.set_defaults(handler=show_command)
+
+    diff_parser = subparsers.add_parser("diff", help="Show aggregate file changes for a session.")
+    diff_parser.add_argument("session_id", nargs="?", help="Session ID to diff (default: active session).")
+    diff_parser.add_argument("--json", action="store_true", help="Output raw JSON.")
+    diff_parser.add_argument("--no-tui", action="store_true", help="Use static pager output instead of interactive TUI.")
+    diff_parser.set_defaults(handler=diff_command)
 
     verify_parser = subparsers.add_parser("verify", help="Verify Merkle integrity.")
     verify_parser.add_argument("session_id", nargs="?")
