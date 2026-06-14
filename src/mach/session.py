@@ -285,7 +285,6 @@ class SessionStore:
                         "step_ids": [],
                         "tool_names": [],
                         "is_new": False,
-                        "step_ids": [],
                         "steps": [],
                     }
                 entry = file_map[fp]
@@ -297,15 +296,12 @@ class SessionStore:
                 entry["lines_removed"] += removed
                 if hunks:
                     entry["hunks"].extend(hunks)
-<<<<<<< Updated upstream
                 if step.get("id") and step["id"] not in entry["step_ids"]:
                     entry["step_ids"].append(step["id"])
-                if stype == "tool" and tool_name not in entry["tool_names"]:
-                    entry["tool_names"].append(tool_name)
-=======
+                # if stype == "tool" and tool_name not in entry["tool_names"]:
+                #     entry["tool_names"].append(tool_name)
                 if tool_data and tool_data["name"] not in entry["tool_names"]:
                     entry["tool_names"].append(tool_data["name"])
->>>>>>> Stashed changes
                 if action == "write" and entry["lines_removed"] == 0 and added > 0:
                     entry["is_new"] = True
 
