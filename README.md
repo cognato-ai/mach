@@ -79,6 +79,9 @@ Use your AI agent as usual, then inspect and sync the captured session:
 # Open the session dashboard
 mach log
 
+# Open the interactive changed-file diff for a session
+mach diff <session_id>
+
 # Push a local session to Mach Web
 mach push <session_id>
 ```
@@ -101,6 +104,7 @@ mach log
 * **Navigate:** Use `Arrow Keys` or `Tab` to move between your active AI sessions and the event timeline.
 * **Inspect:** Press `Enter` on any step to open a detailed modal showing exact file diffs and raw content.
 * **Search:** Press `/` to instantly filter the timeline by tool name, AI reasoning, or file modifications.
+* **Diff:** Run `mach diff <session_id>` for a split-pane file view. The left pane lists changed files, and the right pane shows recorded hunks or a Git diff fallback when Mach did not capture file details.
 
 ## ⚙️ Configuration
 

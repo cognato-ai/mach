@@ -301,7 +301,7 @@ class DiffScreen(Screen):
         height: 1fr;
     }
     #files-pane {
-        width: 40%;
+        width: 42%;
         height: 1fr;
         border-right: tall $primary;
         background: transparent;
@@ -321,7 +321,7 @@ class DiffScreen(Screen):
     #details-pane {
         width: 1fr;
         height: 1fr;
-        padding: 1 2;
+        padding: 0 2 1 2;
         background: transparent;
     }
     #diff-header {
@@ -348,12 +348,7 @@ class DiffScreen(Screen):
         self.files: list = []
 
     def compose(self) -> ComposeResult:
-        try:
-            self.diff_data = self.store.session_diff(self.session_id)
-        except Exception:
-            self.diff_data = {"meta": {}, "files": [], "files_changed": 0,
-                              "total_added": 0, "total_removed": 0,
-                              "tool_calls": 0, "tool_names": {}}
+        self._load_diff_data()
 
         meta = self.diff_data.get("meta") or {}
         agent = str(meta.get("agent", "unknown"))
@@ -372,7 +367,7 @@ class DiffScreen(Screen):
 
         with Horizontal(id="diff-container"):
             with Vertical(id="files-pane"):
-                yield Static("Changed Files", classes="pane-title")
+                yield Static("Changed Files / Steps", classes="pane-title")
                 yield DataTable(id="diff-files-table", cursor_type="row",
                                 zebra_stripes=True, show_cursor=True)
 
@@ -391,8 +386,16 @@ class DiffScreen(Screen):
 
     def on_mount(self) -> None:
         table = self.query_one("#diff-files-table", DataTable)
-        table.add_columns("\u270e/\u2261", "File", "+", "-")
+        table.add_columns("Type", "File", "+/-", "Source")
         self._populate_files_table()
+
+    def _load_diff_data(self) -> None:
+        try:
+            self.diff_data = self.store.session_diff(self.session_id)
+        except Exception:
+            self.diff_data = {"meta": {}, "files": [], "files_changed": 0,
+                              "total_added": 0, "total_removed": 0,
+                              "tool_calls": 0, "tool_names": {}}
 
     def _populate_files_table(self) -> None:
         table = self.query_one("#diff-files-table", DataTable)
@@ -403,10 +406,17 @@ class DiffScreen(Screen):
             fp = f.get("file_path", "?")
             added = f.get("lines_added", 0)
             removed = f.get("lines_removed", 0)
-            icon = {"write": "\u270e", "read": "\u2261", "delete": "\u2391"}.get(action, "\u00b7")
-            table.add_row(icon, fp, str(added), str(removed))
+            source = f.get("diff_source") or ("recorded" if f.get("hunks") or f.get("steps") else "summary")
+            icon = {"write": "edit", "read": "read", "delete": "del"}.get(action, "mod")
+            delta = []
+            if added:
+                delta.append(f"+{added}")
+            if removed:
+                delta.append(f"-{removed}")
+            table.add_row(icon, fp, " ".join(delta) or "-", source)
         if self.files:
             table.move_cursor(row=0)
+            self._update_detail(0)
 
     def _detail_text(self, idx: int) -> Text:
         if not (0 <= idx < len(self.files)):
@@ -417,210 +427,103 @@ class DiffScreen(Screen):
         added = f.get("lines_added", 0)
         removed = f.get("lines_removed", 0)
         hunks = f.get("hunks", [])
-        step_ids = f.get("step_ids", [])
         steps = f.get("steps", [])
         tool_names = f.get("tool_names", [])
+        git_diff = f.get("git_diff") or ""
+        diff_source = f.get("diff_source") or ("recorded" if hunks else "summary")
 
         detail = Text()
-        detail.append("File:  ", style="dim")
         detail.append(f.get("file_path", "?"), style="bold white")
-        detail.append("\n")
+        detail.append("  ")
+        detail.append(diff_source, style="dim cyan" if diff_source == "git" else "dim")
+        detail.append("\n\n")
 
         detail.append("Action:  ", style="dim")
         detail.append(action, style="bold yellow")
+        detail.append("    ")
+
+        detail.append("Lines:  ", style="dim")
+        detail.append(f"+{added} ", style="green" if added else "dim")
+        detail.append(f"-{removed}", style="red" if removed else "dim")
         detail.append("\n")
 
-        if added or removed:
-            detail.append("Lines:  ", style="dim")
-            if added:
-                detail.append(f"+{added} ", style="green")
-            if removed:
-                detail.append(f"-{removed} ", style="red")
-            detail.append("\n")
-
-        if step_ids:
-            detail.append("Steps:  ", style="dim")
-            detail.append(f"{len(step_ids)} step(s) modified this file\n", style="white")
-
         if tool_names:
-            detail.append("Tool(s) used:\n", style="bold")
+            detail.append("\nTools:\n", style="bold")
             for name in tool_names:
-                detail.append(f"  \u2013 {name}\n", style="yellow")
+                detail.append(f"  {name}\n", style="yellow")
 
         if steps:
-            detail.append("Step details:\n", style="bold")
+            detail.append("\nSteps touching this file:\n", style="bold")
             for step in steps:
                 stype = step.get("step_type", "?")
                 tool_name = step.get("tool_name")
                 ts = step.get("ts")
-                detail.append(f"  \u2022 {stype} ", style="dim")
+                step_id = str(step.get("step_id") or "")
+                detail.append("  ")
+                detail.append(_short_id(step_id, "step_", 10), style="blue")
+                detail.append(f"  {stype}", style="dim")
                 if tool_name:
-                    detail.append(f"({tool_name}) ", style="yellow")
+                    detail.append(f"  {tool_name}", style="yellow")
                 if ts:
-                    detail.append(f"@{ts}", style="dim")
+                    detail.append(f"  {_abs_ts(int(ts))}", style="dim")
                 detail.append("\n")
 
         if hunks:
-            detail.append("Hunks:\n", style="bold")
+            detail.append("\nRecorded hunks:\n", style="bold")
             for i, h in enumerate(hunks, 1):
                 from_line = h.get("from", 0)
                 to_line = h.get("to", 0)
                 detail.append(f"  hunk {i}: ", style="dim")
                 detail.append(f"@@ -{from_line} +{to_line} @@\n", style="cyan")
+        elif git_diff:
+            detail.append("\nGit diff fallback:\n", style="bold cyan")
+            self._append_patch(detail, git_diff)
+        else:
+            detail.append("\nNo hunk details were recorded for this file.", style="dim")
 
         return detail
 
+    def _append_patch(self, detail: Text, patch: str, limit: int = 220) -> None:
+        lines = patch.splitlines()
+        for line in lines[:limit]:
+            style = "white"
+            if line.startswith("+++ ") or line.startswith("--- "):
+                style = "dim"
+            elif line.startswith("@@"):
+                style = "cyan"
+            elif line.startswith("+"):
+                style = "green"
+            elif line.startswith("-"):
+                style = "red"
+            elif line.startswith("diff --git"):
+                style = "bold blue"
+            detail.append(line + "\n", style=style)
+        if len(lines) > limit:
+            detail.append(f"... {len(lines) - limit} more line(s)\n", style="dim")
+
     def action_quit(self) -> None:
+        if self.app.__class__.__name__ == "DiffOnlyApp":
+            self.app.exit()
+            return
         self.app.pop_screen()
 
     def action_refresh(self) -> None:
-        self.refresh()
+        self._load_diff_data()
+        self._populate_files_table()
 
     @on(DataTable.RowHighlighted, "#diff-files-table")
     def on_file_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        row = event.cursor_row
+        self._update_detail(event.cursor_row)
+
+    @on(DataTable.RowSelected, "#diff-files-table")
+    def on_file_selected(self, event: DataTable.RowSelected) -> None:
+        row = getattr(event, "cursor_row", None)
+        if row is not None:
+            self._update_detail(row)
+
+    def _update_detail(self, row: int | None) -> None:
         if row is not None:
             self.query_one("#diff-detail-content", Static).update(self._detail_text(row))
-
-class DiffScreen(ModalScreen[None]):
-    BINDINGS = [Binding("escape,q,d", "dismiss", "Close")]
-
-    DEFAULT_CSS = """
-    DiffScreen {
-        align: center middle;
-        background: $background 70%;
-    }
-    #diff-outer {
-        width: 85%;
-        height: 82%;
-        background: $surface;
-        border: round $primary;
-        padding: 0;
-    }
-    #diff-header {
-        height: auto;
-        background: $panel;
-        border-bottom: solid $primary;
-        padding: 1 2;
-    }
-    #diff-body {
-        height: 1fr;
-        padding: 1 2;
-    }
-    #diff-footer-bar {
-        height: 1;
-        background: $panel;
-        border-top: solid $primary;
-        padding: 0 2;
-        content-align: left middle;
-    }
-    """
-
-    def __init__(self, session_id: str, store: SessionStore) -> None:
-        super().__init__()
-        self.session_id = session_id
-        self.store = store
-
-    def compose(self) -> ComposeResult:
-        try:
-            data = self.store.session_diff(self.session_id)
-        except Exception:
-            data = {"meta": {}, "files": [], "files_changed": 0,
-                    "total_added": 0, "total_removed": 0,
-                    "tool_calls": 0, "tool_names": {}}
-
-        meta = data.get("meta") or {}
-        agent = str(meta.get("agent", "unknown"))
-        files = data.get("files") or []
-        files_changed = data.get("files_changed", 0)
-        total_added = data.get("total_added", 0)
-        total_removed = data.get("total_removed", 0)
-        tool_calls = data.get("tool_calls", 0)
-        tool_names = data.get("tool_names") or {}
-        acol = AGENT_COLOR.get(agent.lower(), "white")
-        sid = _short_id(str(meta.get("id", "")), "ses_")
-        branch = str(meta.get("branch", "?"))
-
-        with Vertical(id="diff-outer"):
-            with Container(id="diff-header"):
-                h = Text()
-                h.append("  ⬡ ", style="bold white")
-                h.append("DIFF", style="bold cyan")
-                h.append(f"   {sid}", style="blue")
-                h.append("  agent:", style="dim")
-                h.append(f" {agent}", style=f"bold {acol}")
-                h.append("  on:", style="dim")
-                h.append(f" {branch}", style="cyan")
-                yield Static(h)
-
-            with VerticalScroll(id="diff-body"):
-                if not files:
-                    yield Static(Text("  No file changes recorded in this session.", style="dim"))
-                else:
-                    summary = Text()
-                    summary.append(f"  {files_changed} file(s) changed", style="bold white")
-                    if total_added:
-                        summary.append(f"  +{total_added}", style="green")
-                    if total_removed:
-                        summary.append(f"  -{total_removed}", style="red")
-                    if tool_calls:
-                        summary.append(f"  {tool_calls} tool calls", style="dim yellow")
-                    yield Static(summary)
-                    yield Static(Text(""))
-
-                    top_tools = sorted(tool_names.items(), key=lambda x: -x[1])[:5]
-                    if top_tools:
-                        tools_line = Text()
-                        tools_line.append("  Tools:  ", style="dim")
-                        for i, (name, count) in enumerate(top_tools):
-                            if i > 0:
-                                tools_line.append("  ", style="dim")
-                            tools_line.append(name, style="yellow")
-                            tools_line.append(f"×{count}", style="dim")
-                        yield Static(tools_line)
-                        yield Static(Text(""))
-                        yield Static(Text("  ──", style="dim"))
-
-                    for f in files:
-                        fp = f.get("file_path", "?")
-                        added = f.get("lines_added", 0)
-                        removed = f.get("lines_removed", 0)
-                        is_new = f.get("is_new", False)
-                        tools = f.get("tool_names") or []
-                        fname = fp.split("/")[-1]
-                        dirname = "/".join(fp.split("/")[:-1])
-
-                        line = Text()
-                        line.append("  ", style="dim")
-                        if dirname:
-                            line.append(f"{dirname}/", style="dim")
-                        line.append(fname, style="bold white")
-                        if is_new:
-                            line.append(" (new)", style="green")
-                        elif f.get("action") == "delete":
-                            line.append(" (deleted)", style="red")
-                        if added:
-                            line.append(f" +{added}", style="green")
-                        if removed:
-                            line.append(f" -{removed}", style="red")
-                        if tools:
-                            line.append(f"  ({', '.join(tools)})", style="dim yellow")
-                        yield Static(line)
-
-                        hunks = f.get("hunks") or []
-                        for h in hunks[:8]:
-                            from_line = h.get("from", 0)
-                            to_line = h.get("to", 0)
-                            hl = Text()
-                            hl.append(f"      @@ -{from_line} +{to_line} @@", style="cyan")
-                            yield Static(hl)
-                        if len(hunks) > 8:
-                            yield Static(Text(f"      ... {len(hunks) - 8} more hunk(s)", style="dim"))
-
-            foot = Text()
-            foot.append("  ESC/d ", style="bold yellow")
-            foot.append("close", style="dim")
-            yield Static(foot, id="diff-footer-bar")
 
 
 class MachApp(App):
