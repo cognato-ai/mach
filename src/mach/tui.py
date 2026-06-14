@@ -345,7 +345,7 @@ class DiffScreen(Screen):
         self.session_id = session_id
         self.store = store
         self.diff_data: dict = {}
-        self.files: list = []
+        self.steps: list = []
 
     def compose(self) -> ComposeResult:
         self._load_diff_data()
@@ -367,12 +367,12 @@ class DiffScreen(Screen):
 
         with Horizontal(id="diff-container"):
             with Vertical(id="files-pane"):
-                yield Static("Changed Files / Steps", classes="pane-title")
+                yield Static("File-Changing Steps", classes="pane-title")
                 yield DataTable(id="diff-files-table", cursor_type="row",
                                 zebra_stripes=True, show_cursor=True)
 
             with VerticalScroll(id="details-pane"):
-                detail_placeholder = Text("Select a file to see details", style="dim italic")
+                detail_placeholder = Text("Select a step to see details", style="dim italic")
                 yield Static(detail_placeholder, id="diff-detail-content")
 
         footer = Text()
@@ -386,102 +386,128 @@ class DiffScreen(Screen):
 
     def on_mount(self) -> None:
         table = self.query_one("#diff-files-table", DataTable)
-        table.add_columns("Type", "File", "+/-", "Source")
-        self._populate_files_table()
+        table.add_columns("Step", "Tool / Type", "Files", "+/-")
+        self._populate_steps_table()
 
     def _load_diff_data(self) -> None:
         try:
             self.diff_data = self.store.session_diff(self.session_id)
         except Exception:
-            self.diff_data = {"meta": {}, "files": [], "files_changed": 0,
+            self.diff_data = {"meta": {}, "steps": [], "files": [], "files_changed": 0,
                               "total_added": 0, "total_removed": 0,
                               "tool_calls": 0, "tool_names": {}}
 
-    def _populate_files_table(self) -> None:
+    def _populate_steps_table(self) -> None:
         table = self.query_one("#diff-files-table", DataTable)
         table.clear()
-        self.files = self.diff_data.get("files", [])
-        for f in self.files:
-            action = f.get("action", "?")
-            fp = f.get("file_path", "?")
-            added = f.get("lines_added", 0)
-            removed = f.get("lines_removed", 0)
-            source = f.get("diff_source") or ("recorded" if f.get("hunks") or f.get("steps") else "summary")
-            icon = {"write": "edit", "read": "read", "delete": "del"}.get(action, "mod")
-            delta = []
-            if added:
-                delta.append(f"+{added}")
-            if removed:
-                delta.append(f"-{removed}")
-            table.add_row(icon, fp, " ".join(delta) or "-", source)
-        if self.files:
+        self.steps = self.diff_data.get("steps") or []
+        for step in self.steps:
+            files = step.get("files") or []
+            file_label = self._step_file_label(files)
+            tool_or_type = step.get("tool_name") or step.get("step_type", "?")
+            table.add_row(
+                _short_id(str(step.get("step_id", "")), "step_", 10),
+                tool_or_type,
+                file_label,
+                self._delta_label(step.get("lines_added", 0), step.get("lines_removed", 0)),
+            )
+        if self.steps:
             table.move_cursor(row=0)
             self._update_detail(0)
 
     def _detail_text(self, idx: int) -> Text:
-        if not (0 <= idx < len(self.files)):
-            return Text("Select a file to see details", style="dim italic")
-        f = self.files[idx]
+        if not (0 <= idx < len(self.steps)):
+            return Text("Select a step to see details", style="dim italic")
+        step = self.steps[idx]
+        files = step.get("files") or []
 
+        detail = Text()
+        step_id = str(step.get("step_id") or "")
+        detail.append(_short_id(step_id, "step_", 16), style="bold blue")
+        detail.append("  ")
+        detail.append(step.get("step_type", "?"), style="bold white")
+        if step.get("tool_name"):
+            detail.append("  ")
+            detail.append(step["tool_name"], style="yellow")
+        if step.get("ts"):
+            detail.append("  ")
+            detail.append(_abs_ts(int(step["ts"])), style="dim")
+        detail.append("\n")
+
+        detail.append("Files:  ", style="dim")
+        detail.append(str(step.get("files_changed", len(files))), style="bold white")
+        detail.append("    Lines:  ", style="dim")
+        self._append_delta(detail, step.get("lines_added", 0), step.get("lines_removed", 0))
+        detail.append("    Source:  ", style="dim")
+        source = step.get("diff_source", "recorded")
+        detail.append(source, style="cyan" if source == "git" else "white")
+        detail.append("\n")
+
+        content = _strip(step.get("content") or "").strip()
+        if content:
+            detail.append("\nStep content:\n", style="bold")
+            preview = content if len(content) <= 700 else content[:700].rstrip() + "\n..."
+            for line in preview.splitlines():
+                detail.append(f"  {line}\n", style="dim")
+
+        if not files:
+            detail.append("\nNo file details were recorded for this step.", style="dim")
+            return detail
+
+        detail.append("\nFiles changed by this step:\n", style="bold")
+        for file_change in files:
+            self._append_file_change(detail, file_change)
+
+        return detail
+
+    def _append_file_change(self, detail: Text, f: dict) -> None:
         action = f.get("action", "?")
         added = f.get("lines_added", 0)
         removed = f.get("lines_removed", 0)
         hunks = f.get("hunks", [])
-        steps = f.get("steps", [])
-        tool_names = f.get("tool_names", [])
         git_diff = f.get("git_diff") or ""
         diff_source = f.get("diff_source") or ("recorded" if hunks else "summary")
 
-        detail = Text()
+        detail.append("\n")
         detail.append(f.get("file_path", "?"), style="bold white")
         detail.append("  ")
-        detail.append(diff_source, style="dim cyan" if diff_source == "git" else "dim")
-        detail.append("\n\n")
-
-        detail.append("Action:  ", style="dim")
-        detail.append(action, style="bold yellow")
-        detail.append("    ")
-
-        detail.append("Lines:  ", style="dim")
-        detail.append(f"+{added} ", style="green" if added else "dim")
-        detail.append(f"-{removed}", style="red" if removed else "dim")
+        detail.append(action, style="yellow")
+        detail.append("  ")
+        self._append_delta(detail, added, removed)
+        detail.append("  ")
+        detail.append(diff_source, style="cyan" if diff_source == "git" else "dim")
         detail.append("\n")
-
-        if tool_names:
-            detail.append("\nTools:\n", style="bold")
-            for name in tool_names:
-                detail.append(f"  {name}\n", style="yellow")
-
-        if steps:
-            detail.append("\nSteps touching this file:\n", style="bold")
-            for step in steps:
-                stype = step.get("step_type", "?")
-                tool_name = step.get("tool_name")
-                ts = step.get("ts")
-                step_id = str(step.get("step_id") or "")
-                detail.append("  ")
-                detail.append(_short_id(step_id, "step_", 10), style="blue")
-                detail.append(f"  {stype}", style="dim")
-                if tool_name:
-                    detail.append(f"  {tool_name}", style="yellow")
-                if ts:
-                    detail.append(f"  {_abs_ts(int(ts))}", style="dim")
-                detail.append("\n")
-
         if hunks:
-            detail.append("\nRecorded hunks:\n", style="bold")
+            detail.append("  Recorded hunks:\n", style="bold")
             for i, h in enumerate(hunks, 1):
                 from_line = h.get("from", 0)
                 to_line = h.get("to", 0)
-                detail.append(f"  hunk {i}: ", style="dim")
+                detail.append(f"    hunk {i}: ", style="dim")
                 detail.append(f"@@ -{from_line} +{to_line} @@\n", style="cyan")
         elif git_diff:
-            detail.append("\nGit diff fallback:\n", style="bold cyan")
+            detail.append("  Git diff fallback:\n", style="bold cyan")
             self._append_patch(detail, git_diff)
         else:
-            detail.append("\nNo hunk details were recorded for this file.", style="dim")
+            detail.append("  No hunk details were recorded for this file.\n", style="dim")
 
-        return detail
+    def _append_delta(self, detail: Text, added: int, removed: int) -> None:
+        detail.append(f"+{added} ", style="green" if added else "dim")
+        detail.append(f"-{removed}", style="red" if removed else "dim")
+
+    def _delta_label(self, added: int, removed: int) -> str:
+        delta = []
+        if added:
+            delta.append(f"+{added}")
+        if removed:
+            delta.append(f"-{removed}")
+        return " ".join(delta) or "-"
+
+    def _step_file_label(self, files: list[dict]) -> str:
+        if not files:
+            return "-"
+        if len(files) == 1:
+            return str(files[0].get("file_path") or "?")
+        return f"{len(files)} files"
 
     def _append_patch(self, detail: Text, patch: str, limit: int = 220) -> None:
         lines = patch.splitlines()
@@ -509,7 +535,7 @@ class DiffScreen(Screen):
 
     def action_refresh(self) -> None:
         self._load_diff_data()
-        self._populate_files_table()
+        self._populate_steps_table()
 
     @on(DataTable.RowHighlighted, "#diff-files-table")
     def on_file_highlighted(self, event: DataTable.RowHighlighted) -> None:
