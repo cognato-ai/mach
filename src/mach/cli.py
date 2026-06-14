@@ -1238,12 +1238,12 @@ def diff_command(args: argparse.Namespace) -> None:
         emit(data)
     elif sys.stdout.isatty() and not getattr(args, "no_tui", False) and store.get_config().get("use_tui", True):
         target_id = store.session_diff(session_id=session_id)["meta"].get("id") or session_id
-        from mach.tui import run_diff_tui
-        run_diff_tui(store, session_id=target_id)
+        from mach.tui import DiffOnlyApp
+        DiffOnlyApp(store, target_id).run()
     else:
         data = store.session_diff(session_id=session_id)
         print(render_session_diff(data))
-        
+
 def verify_command(args: argparse.Namespace) -> None:
     store = SessionStore()
     if args.session_id:

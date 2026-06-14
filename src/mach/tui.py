@@ -16,7 +16,7 @@ from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, Screen
 from textual.widgets import DataTable, Footer, ListItem, ListView, Static, Input
 from rich.text import Text
 
@@ -286,32 +286,52 @@ class StepDetail(ModalScreen[None]):
 #  Diff Screen
 # ══════════════════════════════════════════════════════════
 
-class DiffScreen(ModalScreen[None]):
-    BINDINGS = [Binding("escape,q,d", "dismiss", "Close")]
+class DiffScreen(Screen):
+    BINDINGS = [
+        Binding("q,escape", "quit", "Close"),
+        Binding("d", "quit", "Close"),
+        Binding("r", "refresh", "Refresh"),
+    ]
 
     DEFAULT_CSS = """
     DiffScreen {
-        align: center middle;
-        background: $background 70%;
+        background: $background;
     }
-    #diff-outer {
-        width: 85%;
-        height: 82%;
-        background: $surface;
-        border: round $primary;
-        padding: 0;
+    #diff-container {
+        height: 1fr;
     }
-    #diff-header {
-        height: auto;
-        background: $panel;
+    #files-pane {
+        width: 40%;
+        height: 1fr;
+        border-right: tall $primary;
+        background: transparent;
+    }
+    .pane-title {
+        height: 2;
+        padding: 0 2;
         border-bottom: solid $primary;
-        padding: 1 2;
+        background: $panel;
+        content-align: left middle;
     }
-    #diff-body {
+    DataTable {
+        height: 1fr;
+        background: transparent;
+        padding: 0 1;
+    }
+    #details-pane {
+        width: 1fr;
         height: 1fr;
         padding: 1 2;
+        background: transparent;
     }
-    #diff-footer-bar {
+    #diff-header {
+        height: 3;
+        background: $panel;
+        border-bottom: solid $primary;
+        padding: 0 2;
+        content-align: left middle;
+    }
+    #diff-footer {
         height: 1;
         background: $panel;
         border-top: solid $primary;
@@ -324,108 +344,143 @@ class DiffScreen(ModalScreen[None]):
         super().__init__()
         self.session_id = session_id
         self.store = store
+        self.diff_data: dict = {}
+        self.files: list = []
 
     def compose(self) -> ComposeResult:
         try:
-            data = self.store.session_diff(self.session_id)
+            self.diff_data = self.store.session_diff(self.session_id)
         except Exception:
-            data = {"meta": {}, "files": [], "files_changed": 0,
-                    "total_added": 0, "total_removed": 0,
-                    "tool_calls": 0, "tool_names": {}}
+            self.diff_data = {"meta": {}, "files": [], "files_changed": 0,
+                              "total_added": 0, "total_removed": 0,
+                              "tool_calls": 0, "tool_names": {}}
 
-        meta = data.get("meta") or {}
+        meta = self.diff_data.get("meta") or {}
         agent = str(meta.get("agent", "unknown"))
-        files = data.get("files") or []
-        files_changed = data.get("files_changed", 0)
-        total_added = data.get("total_added", 0)
-        total_removed = data.get("total_removed", 0)
-        tool_calls = data.get("tool_calls", 0)
-        tool_names = data.get("tool_names") or {}
         sid = _short_id(str(meta.get("id", "")), "ses_")
         branch = str(meta.get("branch", "?"))
 
-        with Vertical(id="diff-outer"):
-            with Container(id="diff-header"):
-                h = Text()
-                h.append("  ⬡ ", style="bold white")
-                h.append("DIFF", style="bold cyan")
-                h.append(f"   {sid}", style="blue")
-                h.append("  agent:", style="dim")
-                h.append(f" {agent}", style="bold yellow")
-                h.append("  on:", style="dim")
-                h.append(f" {branch}", style="cyan")
-                yield Static(h)
+        header = Text()
+        header.append("\u25e1 ", style="bold white")
+        header.append("DIFF", style="bold cyan")
+        header.append(f"  {sid}", style="blue")
+        header.append("  ", style="dim")
+        header.append(f"{agent}  ", style="bold yellow")
+        header.append(f"on {branch}", style="cyan")
 
-            with VerticalScroll(id="diff-body"):
-                if not files:
-                    yield Static(Text("  No file changes recorded in this session.", style="dim"))
-                else:
-                    summary = Text()
-                    summary.append(f"  {files_changed} file(s) changed", style="bold white")
-                    if total_added:
-                        summary.append(f"  +{total_added}", style="green")
-                    if total_removed:
-                        summary.append(f"  -{total_removed}", style="red")
-                    if tool_calls:
-                        summary.append(f"  {tool_calls} tool calls", style="dim yellow")
-                    yield Static(summary)
-                    yield Static(Text(""))
+        yield Static(header, id="diff-header")
 
-                    top_tools = sorted(tool_names.items(), key=lambda x: -x[1])[:5]
-                    if top_tools:
-                        tools_line = Text()
-                        tools_line.append("  Tools:  ", style="dim")
-                        for i, (name, count) in enumerate(top_tools):
-                            if i > 0:
-                                tools_line.append("  ", style="dim")
-                            tools_line.append(name, style="yellow")
-                            tools_line.append(f"×{count}", style="dim")
-                        yield Static(tools_line)
-                        yield Static(Text(""))
+        with Horizontal(id="diff-container"):
+            with Vertical(id="files-pane"):
+                yield Static("Changed Files", classes="pane-title")
+                yield DataTable(id="diff-files-table", cursor_type="row",
+                                zebra_stripes=True, show_cursor=True)
 
-                    for f in files:
-                        fp = f.get("file_path", "?")
-                        added = f.get("lines_added", 0)
-                        removed = f.get("lines_removed", 0)
-                        is_new = f.get("is_new", False)
-                        tools = f.get("tool_names") or []
-                        fname = fp.split("/")[-1]
-                        dirname = "/".join(fp.split("/")[:-1])
+            with VerticalScroll(id="details-pane"):
+                detail_placeholder = Text("Select a file to see details", style="dim italic")
+                yield Static(detail_placeholder, id="diff-detail-content")
 
-                        line = Text()
-                        line.append("  ", style="dim")
-                        if dirname:
-                            line.append(f"{dirname}/", style="dim")
-                        line.append(fname, style="bold white")
-                        if is_new:
-                            line.append(" (new)", style="green")
-                        elif f.get("action") == "delete":
-                            line.append(" (deleted)", style="red")
-                        if added:
-                            line.append(f" +{added}", style="green")
-                        if removed:
-                            line.append(f" -{removed}", style="red")
-                        if tools:
-                            line.append(f"  ({', '.join(tools)})", style="dim yellow")
-                        yield Static(line)
+        footer = Text()
+        footer.append("q/esc/d ", style="bold yellow")
+        footer.append("close  \u00b7  ", style="dim")
+        footer.append("\u2191\u2193 ", style="bold yellow")
+        footer.append("navigate  \u00b7  ", style="dim")
+        footer.append("enter ", style="bold yellow")
+        footer.append("focus", style="dim")
+        yield Static(footer, id="diff-footer")
 
-                        hunks = f.get("hunks") or []
-                        for h in hunks[:8]:
-                            from_line = h.get("from", 0)
-                            to_line = h.get("to", 0)
-                            hl = Text()
-                            hl.append(f"      @@ -{from_line} +{to_line} @@", style="cyan")
-                            yield Static(hl)
+    def on_mount(self) -> None:
+        table = self.query_one("#diff-files-table", DataTable)
+        table.add_columns("\u270e/\u2261", "File", "+", "-")
+        self._populate_files_table()
 
-            foot = Text()
-            foot.append("  ESC/d ", style="bold yellow")
-            foot.append("close", style="dim")
-            yield Static(foot, id="diff-footer-bar")
+    def _populate_files_table(self) -> None:
+        table = self.query_one("#diff-files-table", DataTable)
+        table.clear()
+        self.files = self.diff_data.get("files", [])
+        for f in self.files:
+            action = f.get("action", "?")
+            fp = f.get("file_path", "?")
+            added = f.get("lines_added", 0)
+            removed = f.get("lines_removed", 0)
+            icon = {"write": "\u270e", "read": "\u2261", "delete": "\u2391"}.get(action, "\u00b7")
+            table.add_row(icon, fp, str(added), str(removed))
+        if self.files:
+            table.move_cursor(row=0)
 
+    def _detail_text(self, idx: int) -> Text:
+        if not (0 <= idx < len(self.files)):
+            return Text("Select a file to see details", style="dim italic")
+        f = self.files[idx]
 
-# ══════════════════════════════════════════════════════════
-#  Main App
-# ══════════════════════════════════════════════════════════
+        action = f.get("action", "?")
+        added = f.get("lines_added", 0)
+        removed = f.get("lines_removed", 0)
+        hunks = f.get("hunks", [])
+        step_ids = f.get("step_ids", [])
+        steps = f.get("steps", [])
+        tool_names = f.get("tool_names", [])
+
+        detail = Text()
+        detail.append("File:  ", style="dim")
+        detail.append(f.get("file_path", "?"), style="bold white")
+        detail.append("\n")
+
+        detail.append("Action:  ", style="dim")
+        detail.append(action, style="bold yellow")
+        detail.append("\n")
+
+        if added or removed:
+            detail.append("Lines:  ", style="dim")
+            if added:
+                detail.append(f"+{added} ", style="green")
+            if removed:
+                detail.append(f"-{removed} ", style="red")
+            detail.append("\n")
+
+        if step_ids:
+            detail.append("Steps:  ", style="dim")
+            detail.append(f"{len(step_ids)} step(s) modified this file\n", style="white")
+
+        if tool_names:
+            detail.append("Tool(s) used:\n", style="bold")
+            for name in tool_names:
+                detail.append(f"  \u2013 {name}\n", style="yellow")
+
+        if steps:
+            detail.append("Step details:\n", style="bold")
+            for step in steps:
+                stype = step.get("step_type", "?")
+                tool_name = step.get("tool_name")
+                ts = step.get("ts")
+                detail.append(f"  \u2022 {stype} ", style="dim")
+                if tool_name:
+                    detail.append(f"({tool_name}) ", style="yellow")
+                if ts:
+                    detail.append(f"@{ts}", style="dim")
+                detail.append("\n")
+
+        if hunks:
+            detail.append("Hunks:\n", style="bold")
+            for i, h in enumerate(hunks, 1):
+                from_line = h.get("from", 0)
+                to_line = h.get("to", 0)
+                detail.append(f"  hunk {i}: ", style="dim")
+                detail.append(f"@@ -{from_line} +{to_line} @@\n", style="cyan")
+
+        return detail
+
+    def action_quit(self) -> None:
+        self.app.pop_screen()
+
+    def action_refresh(self) -> None:
+        self.refresh()
+
+    @on(DataTable.RowHighlighted, "#diff-files-table")
+    def on_file_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        row = event.cursor_row
+        if row is not None:
+            self.query_one("#diff-detail-content", Static).update(self._detail_text(row))
 
 class DiffScreen(ModalScreen[None]):
     BINDINGS = [Binding("escape,q,d", "dismiss", "Close")]
@@ -1077,13 +1132,5 @@ class DiffOnlyApp(App):
         self.push_screen(DiffScreen(self.session_id, self.store))
 
 
-def run_diff_tui(store: SessionStore, session_id: str) -> None:
-    DiffOnlyApp(store, session_id).run()
-
-
 def run_tui(store: SessionStore) -> None:
     MachApp(store).run()
-
-
-def run_diff_tui(store: SessionStore, session_id: str | None = None) -> None:
-    MachApp(store, initial_diff_session_id=session_id).run()
