@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import os
-import subprocess
+import shutil
 import uuid
-from pathlib import Path
 from time import time
 from typing import Any
 
-from mach.config import DEFAULT_CONFIG, merge_config
-from mach.db import connect, init_db, reset_db
+from mach.db import connect, reset_db
 from mach.git_utils import current_branch, head_commit, remote_origin_url, repository_name
-from mach.locking import file_lock
 from mach.merkle import chain_hash, hash_payload
 from mach.models import (
     FileChange,
@@ -18,53 +15,23 @@ from mach.models import (
     MachSyncState,
     PullSessionDetails,
     RemoteInfo,
-    RepositoryDetails,
     SessionMeta,
     Step,
     ToolCall,
 )
-from mach.repository import resolve_paths
 from mach.utils import (
     append_jsonl,
-    canonical_json,
-    ensure_json_file,
     read_json,
     read_jsonl,
     write_json,
 )
+from mach.session.fix import SessionFixMixin
+from mach.session.base import MachError
 
-
-class MachError(RuntimeError):
-    pass
-
-
-class SessionStore:
-    def __init__(self, repo_root: Path | None = None) -> None:
-        self.paths = resolve_paths(repo_root)
-
-    def get_config(self) -> dict:
-        if not self.paths.config_path.exists():
-            return DEFAULT_CONFIG
-        return merge_config(read_json(self.paths.config_path))
-
-    def init_repo(self) -> Path:
-        self.paths.mach_dir.mkdir(parents=True, exist_ok=True)
-        self.paths.sessions_dir.mkdir(parents=True, exist_ok=True)
-        self.paths.pack_dir.mkdir(parents=True, exist_ok=True)
-        self.paths.inbox_dir.mkdir(parents=True, exist_ok=True)
-        self.paths.blobs_dir.mkdir(parents=True, exist_ok=True)
-        ensure_json_file(self.paths.config_path, DEFAULT_CONFIG)
-        ensure_json_file(self.paths.agent_sessions_path, {})
-        ensure_json_file(self.paths.ingest_state_path, {"files": {}})
-        self._write_config(merge_config(read_json(self.paths.config_path)))
-        if not self.paths.head_path.exists():
-            self.paths.head_path.write_text("", encoding="utf-8")
-        init_db(self.paths.db_path)
-        return self.paths.mach_dir
-
+class SessionLifecycleMixin(SessionFixMixin):
     def start_session(self, agent: str = "unknown", task_desc: str | None = None) -> dict[str, Any]:
         self.init_repo()
-        with file_lock(self.paths.lock_path):
+        with self.file_lock_context():
             return self._start_session_unlocked(agent=agent, task_desc=task_desc)
 
     def _start_session_unlocked(self, agent: str = "unknown", task_desc: str | None = None) -> dict[str, Any]:
@@ -87,7 +54,7 @@ class SessionStore:
                     import sys
                     print(f"\033[93mWarning\033[0m: There are {row['c']} other active AI session(s) modifying this same commit state concurrently.", file=sys.stderr)
         except Exception:
-            pass  # fail gracefully if db not ready
+            pass
 
     def _create_session_unlocked(self, agent: str = "unknown", task_desc: str | None = None, agent_session_id: str | None = None) -> dict[str, Any]:
         session_id = f"ses_{uuid.uuid4().hex}"
@@ -126,7 +93,7 @@ class SessionStore:
 
     def end_session(self, session_id: str | None = None) -> dict[str, Any]:
         self.init_repo()
-        with file_lock(self.paths.lock_path):
+        with self.file_lock_context():
             return self._end_session_unlocked(session_id=session_id)
 
     def _end_session_unlocked(self, session_id: str | None = None) -> dict[str, Any]:
@@ -160,7 +127,7 @@ class SessionStore:
 
     def record_step(self, step_dict: dict[str, Any]) -> dict[str, Any]:
         self.init_repo()
-        with file_lock(self.paths.lock_path):
+        with self.file_lock_context():
             active = self.get_active_session_id()
             session_id = active
             if not session_id:
@@ -182,7 +149,7 @@ class SessionStore:
         end_session: bool = False,
     ) -> dict[str, Any]:
         self.init_repo()
-        with file_lock(self.paths.lock_path):
+        with self.file_lock_context():
             session_id = self._ensure_agent_session_unlocked(
                 agent=agent,
                 source_session_id=source_session_id,
@@ -195,7 +162,7 @@ class SessionStore:
 
     def end_agent_session(self, agent: str, source_session_id: str | None = None) -> dict[str, Any]:
         self.init_repo()
-        with file_lock(self.paths.lock_path):
+        with self.file_lock_context():
             mappings = self._read_agent_sessions()
             key = self._agent_session_key(agent, source_session_id)
             session_id = mappings.get(key)
@@ -233,9 +200,6 @@ class SessionStore:
         for session_id in self._session_ids():
             results.append(self.verify_session(session_id))
         return results
-
-    def _is_valid_session_id(self, session_id: str) -> bool:
-        return session_id.startswith("ses_") and len(session_id) == 36
 
     def session_diff(self, session_id: str | None = None) -> dict[str, Any]:
         self.init_repo()
@@ -310,14 +274,11 @@ class SessionStore:
                     entry["hunks"].extend(hunks)
                 if step.get("id") and step["id"] not in entry["step_ids"]:
                     entry["step_ids"].append(step["id"])
-                # if stype == "tool" and tool_name not in entry["tool_names"]:
-                #     entry["tool_names"].append(tool_name)
                 if tool_data and tool_data["name"] not in entry["tool_names"]:
                     entry["tool_names"].append(tool_data["name"])
                 if action == "write" and entry["lines_removed"] == 0 and added > 0:
                     entry["is_new"] = True
 
-                # Track steps that touched this file
                 if step_id not in entry["step_ids"]:
                     entry["step_ids"].append(step_id)
                 if stype in {"tool", "input", "output", "reasoning"}:
@@ -325,7 +286,7 @@ class SessionStore:
                         "step_id": step_id,
                         "step_type": stype,
                         "ts": step.get("ts"),
-                        "tool_name": tool_data["name"] if tool_data else None,
+                        "tool_name": tool_name if stype == "tool" else None,
                     }
                     if step_info not in entry["steps"]:
                         entry["steps"].append(step_info)
@@ -422,92 +383,13 @@ class SessionStore:
             "files": files,
         }
 
-    def _git_diff_args_for_session(self, meta: dict[str, Any], file_path: str | None = None) -> list[str]:
-        pre_commit = meta.get("pre_commit")
-        post_commit = meta.get("post_commit")
-        args = ["diff"]
-        if pre_commit and post_commit and pre_commit != post_commit:
-            args.extend([str(pre_commit), str(post_commit)])
-        elif pre_commit:
-            args.append(str(pre_commit))
-        if file_path:
-            args.extend(["--", file_path])
-        return args
-
-    def _run_git_capture(self, args: list[str]) -> str:
-        try:
-            result = subprocess.run(
-                ["git", *args],
-                cwd=self.paths.repo_root,
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-            )
-        except OSError:
-            return ""
-        if result.returncode not in (0, 1):
-            return ""
-        return result.stdout
-
-    def _git_diff_for_file(self, meta: dict[str, Any], file_path: str) -> str:
-        return self._run_git_capture(self._git_diff_args_for_session(meta, file_path)).strip()
-
-    def _git_diff_name_status(self, meta: dict[str, Any]) -> list[dict[str, str]]:
-        args = self._git_diff_args_for_session(meta)
-        args.insert(1, "--name-status")
-        output = self._run_git_capture(args)
-        files = []
-        for line in output.splitlines():
-            if not line.strip():
-                continue
-            parts = line.split("\t")
-            status = parts[0]
-            path = parts[-1] if len(parts) > 1 else ""
-            if not path:
-                continue
-            action = "delete" if status.startswith("D") else "write"
-            files.append({"file_path": path, "action": action, "status": status})
-        return files
-
-    def _git_diff_numstat_for_file(self, meta: dict[str, Any], file_path: str) -> tuple[int, int]:
-        args = self._git_diff_args_for_session(meta, file_path)
-        args.insert(1, "--numstat")
-        output = self._run_git_capture(args)
-        added = 0
-        removed = 0
-        for line in output.splitlines():
-            parts = line.split("\t")
-            if len(parts) < 3 or parts[0] == "-" or parts[1] == "-":
-                continue
-            added += int(parts[0])
-            removed += int(parts[1])
-        return added, removed
-
     def list_sessions(self) -> list[dict[str, Any]]:
         self.init_repo()
-
         sessions = []
         for session in os.scandir(self.paths.sessions_dir):
             if self._is_valid_session_id(session.name):
-                # sessions.append(SessionMeta.from_dict(self.read_session_meta(session.name))) # TODO: Use dataclasses for data access
                 sessions.append(self.read_session_meta(session.name))
-
         return sessions
-
-        # try:
-        #     with connect(self.paths.db_path) as conn:
-        #         rows = conn.execute(
-        #             """
-        #             SELECT id, started_at, ended_at, agent, agent_session_id, branch, pre_commit, post_commit,
-        #                    step_count, risk_count, forked_from, synced_at
-        #             FROM sessions
-        #             ORDER BY started_at DESC
-        #             """
-        #         ).fetchall()
-        #     return [dict(row) for row in rows]
-        # except Exception:
-        #     return []
 
     def show_session(self, session_id: str | None = None) -> dict[str, Any]:
         self.init_repo()
@@ -518,7 +400,6 @@ class SessionStore:
         session_dir = self.paths.sessions_dir / target_id
         steps = read_jsonl(session_dir / "steps.jsonl")
         
-        # Hydrate steps with blob content
         for step in steps:
             if step.get("content") is None and step.get("content_hash"):
                 blob_content = self._read_blob(step["content_hash"])
@@ -537,7 +418,7 @@ class SessionStore:
 
     def resume_branch(self, branch: str | None = None) -> dict[str, Any]:
         self.init_repo()
-        with file_lock(self.paths.lock_path):
+        with self.file_lock_context():
             target_branch = branch or current_branch(self.paths.repo_root)
             with connect(self.paths.db_path) as conn:
                 row = conn.execute(
@@ -556,7 +437,6 @@ class SessionStore:
                 meta["post_commit"] = None
                 self._write_session_meta(meta)
                 self._upsert_session_index(meta, self._step_count(session_id), self._risk_count(session_id))
-                # Record a system step to mark the resume event
                 self._record_step_for_session_unlocked(session_id, {
                     "type": "system_action",
                     "content": f"Session resumed on branch {target_branch}",
@@ -584,7 +464,7 @@ class SessionStore:
     def rewind(self, target: str) -> dict[str, Any]:
         self.init_repo()
         import subprocess
-        with file_lock(self.paths.lock_path):
+        with self.file_lock_context():
             active = self.get_active_session_id()
             if not active:
                 raise MachError("No active session to rewind within.")
@@ -609,7 +489,7 @@ class SessionStore:
     def clean(self, max_days: int = 7) -> dict[str, Any]:
         self.init_repo()
         import shutil
-        with file_lock(self.paths.lock_path):
+        with self.file_lock_context():
             active = self.get_active_session_id()
             cutoff = int(time()) - (max_days * 86400)
             cleaned = []
@@ -642,111 +522,12 @@ class SessionStore:
         active = self.get_active_session_id()
         if not active:
             return None
-        with file_lock(self.paths.lock_path):
+        with self.file_lock_context():
             return self._end_session_unlocked(active)
-
-    def read_config(self) -> dict[str, Any]:
-        self.init_repo()
-        return merge_config(read_json(self.paths.config_path))
-
-    def update_config(self, updates: dict[str, Any]) -> dict[str, Any]:
-        self.init_repo()
-        with file_lock(self.paths.lock_path):
-            current = merge_config(read_json(self.paths.config_path))
-            current.update(updates)
-            self._write_config(current)
-            return current
-
-    def read_tracked_repo(self) -> RepositoryDetails | None:
-        self.init_repo()
-        if not self.paths.tracked_repo_path.exists():
-            return None
-        return RepositoryDetails.from_dict(read_json(self.paths.tracked_repo_path))
-
-    def write_tracked_repo(self, repository: RepositoryDetails) -> RepositoryDetails:
-        self.init_repo()
-        with file_lock(self.paths.lock_path):
-            write_json(self.paths.tracked_repo_path, repository.to_dict())
-            return repository
-
-    # ── remote-format helpers ────────────────────────────────────────────────
-
-    @staticmethod
-    def _normalize_remote(raw: dict[str, Any]) -> dict[str, Any]:
-        """Ensure the remote dict is in the canonical nested {git, mach} format.
-
-        Handles three cases transparently:
-          1. Already in new format  → strips any stale flat keys and returns clean dict.
-          2. Old flat format        → migrates url/repository_name → git,
-                                      all push-tracking fields → mach.
-          3. Empty / None           → returns a zeroed-out nested dict.
-        """
-        if not raw:
-            return {"git": {}, "mach": {}}
-
-        already_nested = "git" in raw or "mach" in raw
-
-        if already_nested:
-            # Accept the nested sub-dicts, drop any leftover flat keys.
-            return {
-                "git": dict(raw.get("git") or {}),
-                "mach": dict(raw.get("mach") or {}),
-            }
-
-        # Old flat format — split by concern.
-        return {
-            "git": {
-                "url": raw.get("url"),
-                "repository_name": raw.get("repository_name"),
-            },
-            "mach": {
-                "last_push_id": raw.get("last_push_id"),
-                "last_pushed_at": raw.get("last_pushed_at"),
-                "last_pushed_ts": raw.get("last_pushed_ts", 0),
-                "last_pushed_step_id": raw.get("last_pushed_step_id"),
-                "pushed_root": raw.get("pushed_root"),
-                "server_session_id": raw.get("server_session_id"),
-                "server_root_before": raw.get("server_root_before"),
-                "server_root_after": raw.get("server_root_after"),
-                "blobs_received": raw.get("blobs_received"),
-                "steps_received": raw.get("steps_received"),
-                "last_pulled_at": raw.get("last_pulled_at"),
-                "last_pulled_ts": raw.get("last_pulled_ts", 0),
-                "last_pulled_step_id": raw.get("last_pulled_step_id"),
-            },
-        }
-
-    def update_push_state(
-        self,
-        session_id: str,
-        *,
-        git_updates: dict[str, Any] | None = None,
-        mach_updates: dict[str, Any] | None = None,
-        step_count: int | None = None,
-        risk_count: int | None = None,
-    ) -> dict[str, Any]:
-        self.init_repo()
-        with file_lock(self.paths.lock_path):
-            meta = self.read_session_meta(session_id)
-            # Normalize to nested format — migrates old flat meta.json files
-            # transparently on the first write after the refactor.
-            remote = self._normalize_remote(dict(meta.get("remote") or {}))
-            if git_updates:
-                remote["git"].update(git_updates)
-            if mach_updates:
-                remote["mach"].update(mach_updates)
-            meta["remote"] = remote
-            self._write_session_meta(meta)
-            self._upsert_session_index(
-                meta,
-                step_count=step_count if step_count is not None else self._step_count(session_id),
-                risk_count=risk_count if risk_count is not None else self._risk_count(session_id),
-            )
-            return meta
 
     def clone_session(self, source_session_id: str) -> dict[str, Any]:
         self.init_repo()
-        with file_lock(self.paths.lock_path):
+        with self.file_lock_context():
             source_dir = self.paths.sessions_dir / source_session_id
             if not source_dir.exists():
                 raise MachError(f"Unknown session: {source_session_id}")
@@ -787,7 +568,6 @@ class SessionStore:
                     mapped = [cloned_steps[cloned["step_num"] - 2]["id"]]
                 cloned["caused_by"] = mapped
                 
-                # Also map parent_step_id to the cloned step's parent
                 old_parent = cloned.get("parent_step_id")
                 if old_parent:
                     cloned["parent_step_id"] = id_map.get(old_parent, old_parent)
@@ -798,7 +578,7 @@ class SessionStore:
                 "last_pushed_ts": now if last_inherited_step_id else 0,
                 "last_pulled_step_id": last_inherited_step_id,
                 "last_pulled_ts": now if last_inherited_step_id else 0,
-                "last_pulled_at": str(now) if last_inherited_step_id else None,
+                "last_pulled_at": now if last_inherited_step_id else None,
                 "forked_from_session_id": source_session_id,
                 "forked_from_root": source_merkle.get("root"),
             })
@@ -852,7 +632,7 @@ class SessionStore:
         source_blobs: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         self.init_repo()
-        with file_lock(self.paths.lock_path):
+        with self.file_lock_context():
             clone_id = f"ses_{uuid.uuid4().hex}"
             clone_dir = self.paths.sessions_dir / clone_id
             clone_dir.mkdir(parents=True, exist_ok=False)
@@ -915,7 +695,6 @@ class SessionStore:
                     mapped = [cloned_steps[cloned["step_num"] - 2]["id"]]
                 cloned["caused_by"] = mapped
 
-                # Also map parent_step_id to the cloned step's parent
                 old_parent = cloned.get("parent_step_id")
                 if old_parent:
                     cloned["parent_step_id"] = id_map.get(old_parent, old_parent)
@@ -975,350 +754,6 @@ class SessionStore:
                 "metadata": cloned_meta,
             }
 
-    def _write_remote_blobs_unlocked(self, blobs: list[dict[str, Any]]) -> int:
-        written = 0
-        for blob in blobs:
-            content_hash = blob.get("content_hash")
-            content = blob.get("content")
-            if not content_hash or content is None:
-                continue
-            self._write_blob(str(content_hash), str(content))
-            written += 1
-        return written
-
-    def fsck(self) -> dict[str, Any]:
-        self.init_repo()
-        with file_lock(self.paths.lock_path):
-            verification = []
-            if self.get_config().get("db_enabled", True):
-                reset_db(self.paths.db_path)
-
-            rebuilt_sessions = 0
-            rebuilt_steps = 0
-            rebuilt_risk_flags = 0
-
-            for session_id in self._session_ids():
-                result = self.verify_session(session_id)
-                verification.append(result)
-
-                session_dir = self.paths.sessions_dir / session_id
-                meta = read_json(session_dir / "meta.json")
-                steps = read_jsonl(session_dir / "steps.jsonl")
-                risk_count = sum(len(step.get("risk_flags", [])) for step in steps)
-
-                self._upsert_session_index(
-                    meta,
-                    step_count=len(steps),
-                    risk_count=risk_count,
-                )
-                for step in steps:
-                    self._insert_step(step)
-
-                rebuilt_sessions += 1
-                rebuilt_steps += len(steps)
-                rebuilt_risk_flags += risk_count
-
-            active = self.get_active_session_id()
-            if active and not (self.paths.sessions_dir / active).exists():
-                self.paths.head_path.write_text("", encoding="utf-8")
-                active = None
-
-            return {
-                "ok": all(item["valid"] for item in verification),
-                "rebuilt_db": str(self.paths.db_path),
-                "sessions_rebuilt": rebuilt_sessions,
-                "steps_rebuilt": rebuilt_steps,
-                "risk_flags_rebuilt": rebuilt_risk_flags,
-                "active_session": active,
-                "verification": verification,
-            }
-
-    def fix_sessions(self, session_id: str | None = None, *, apply: bool = False) -> dict[str, Any]:
-        self.init_repo()
-        with file_lock(self.paths.lock_path):
-            session_ids = [session_id] if session_id else self._session_ids()
-            results = []
-            for sid in session_ids:
-                session_dir = self.paths.sessions_dir / sid
-                if not session_dir.exists():
-                    raise MachError(f"Unknown session: {sid}")
-                results.append(self._fix_session_chunks_unlocked(sid, apply=apply))
-            return {
-                "applied": apply,
-                "sessions_checked": len(results),
-                "sessions_changed": sum(1 for item in results if item["changed"]),
-                "merged_steps": sum(item["merged_steps"] for item in results),
-                "normalized_tool_hashes": sum(item["normalized_tool_hashes"] for item in results),
-                "linked_list_fixes": sum(1 for item in results if item.get("linked_list_fixed")),
-                "backfilled_file_changes": sum(item.get("backfilled_file_changes", 0) for item in results),
-                "results": results,
-            }
-
-    def read_session_meta(self, session_id: str) -> dict[str, Any]:
-        meta = read_json(self.paths.sessions_dir / session_id / "meta.json")
-        if meta and "remote" in meta:
-            meta["remote"] = self._normalize_remote(dict(meta.get("remote") or {}))
-        return meta
-
-    def _fix_session_chunks_unlocked(self, session_id: str, *, apply: bool) -> dict[str, Any]:
-        session_dir = self.paths.sessions_dir / session_id
-        steps = read_jsonl(session_dir / "steps.jsonl")
-        normalized, id_map, merged_steps, normalized_tool_hashes, backfilled_file_changes = self._normalize_steps(steps)
-
-        # Check if parent_step_id is missing on any step or if head_step_id is missing in session meta.
-        # This allows the 'fix' command to act as a migration utility to backfill these fields!
-        meta = self.read_session_meta(session_id)
-        has_missing_linked_list_fields = False
-        if not meta or not meta.get("head_step_id"):
-            has_missing_linked_list_fields = True
-        else:
-            for step in steps:
-                if "parent_step_id" not in step or step["parent_step_id"] is None:
-                    # Let the first step have parent_step_id None, but any subsequent step must have parent_step_id set
-                    if step.get("step_num", 1) > 1:
-                        has_missing_linked_list_fields = True
-                        break
-
-        changed = merged_steps > 0 or normalized_tool_hashes > 0 or has_missing_linked_list_fields or backfilled_file_changes > 0
-
-        if apply and changed:
-            self._write_normalized_session_unlocked(session_id, normalized, id_map)
-
-        return {
-            "session_id": session_id,
-            "before_steps": len(steps),
-            "after_steps": len(normalized),
-            "merged_steps": merged_steps,
-            "normalized_tool_hashes": normalized_tool_hashes,
-            "linked_list_fixed": has_missing_linked_list_fields,
-            "backfilled_file_changes": backfilled_file_changes,
-            "changed": changed,
-        }
-
-    def _normalize_steps(self, steps: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, str], int, int, int]:
-        mergeable_types = {"input", "reasoning", "output"}
-        normalized: list[dict[str, Any]] = []
-        id_map: dict[str, str] = {}
-        merged_steps = 0
-        normalized_tool_hashes = 0
-        backfilled_file_changes = 0
-
-        for step in steps:
-            current = dict(step)
-            if self._normalize_tool_step_hash(current):
-                normalized_tool_hashes += 1
-            if self._backfill_tool_details(current):
-                backfilled_file_changes += 1
-            current_id = str(current.get("id") or "")
-            if current_id:
-                id_map[current_id] = current_id
-
-            if (
-                normalized
-                and self._can_merge_step_chunks(normalized[-1], current, mergeable_types)
-            ):
-                target = normalized[-1]
-                target_id = str(target.get("id") or "")
-                if current_id and target_id:
-                    id_map[current_id] = target_id
-                target["_merged_content"] = self._step_text(target) + self._step_text(current)
-                target.setdefault("_merged_from", []).append(current_id)
-                merged_steps += 1
-                continue
-
-            normalized.append(current)
-
-        for index, step in enumerate(normalized, start=1):
-            step["step_num"] = index
-            caused_by = []
-            for cause in step.get("caused_by") or []:
-                mapped = id_map.get(cause, cause)
-                if mapped and mapped != step.get("id") and mapped not in caused_by:
-                    caused_by.append(mapped)
-            step["caused_by"] = caused_by
-
-        return normalized, id_map, merged_steps, normalized_tool_hashes, backfilled_file_changes
-
-    def _normalize_tool_step_hash(self, step: dict[str, Any]) -> bool:
-        tool = step.get("tool")
-        if step.get("type") != "tool" or not isinstance(tool, dict):
-            return False
-
-        tool_hash = tool.get("content_hash")
-        tool_content = tool.get("content")
-        if not tool_hash and tool_content is not None:
-            tool_hash = hash_payload({"content": str(tool_content)})
-            tool["content_hash"] = tool_hash
-
-        if not tool_hash or step.get("content_hash") == tool_hash:
-            return False
-
-        step["content_hash"] = tool_hash
-        step.pop("content", None)
-        return True
-
-    def _backfill_tool_details(self, step: dict[str, Any]) -> bool:
-        if step.get("type") != "tool":
-            return False
-        tool = step.get("tool")
-        if not isinstance(tool, dict):
-            return False
-
-        modified = False
-        tool_name = tool.get("name", "")
-
-        has_category = tool.get("category") not in (None, "", "exec")
-        has_changes = bool(step.get("file_changes"))
-
-        if has_category and has_changes:
-            return False
-
-        tool_content = tool.get("content")
-        if tool_content is None and tool.get("content_hash"):
-            tool_content = self._read_blob(tool["content_hash"])
-
-        if tool_content is not None:
-            from mach.hooks.helpers import extract_tool_details
-            try:
-                category, file_changes = extract_tool_details(self.paths.repo_root, tool_name, tool_content)
-                if not has_category and category and category != tool.get("category"):
-                    tool["category"] = category
-                    modified = True
-                if not has_changes and file_changes:
-                    step["file_changes"] = file_changes
-                    modified = True
-            except Exception:
-                pass
-        return modified
-
-    def _can_merge_step_chunks(self, previous: dict[str, Any], current: dict[str, Any], mergeable_types: set[str]) -> bool:
-        step_type = previous.get("type")
-        if step_type != current.get("type") or step_type not in mergeable_types:
-            return False
-        blocked_fields = ("tool", "file_changes", "risk_flags")
-        return not any(previous.get(field) or current.get(field) for field in blocked_fields)
-
-    def _step_text(self, step: dict[str, Any]) -> str:
-        if "_merged_content" in step:
-            return str(step.get("_merged_content") or "")
-        if step.get("content") is not None:
-            return str(step.get("content") or "")
-        blob = self._read_blob(step.get("content_hash"))
-        return blob or ""
-
-    def _write_normalized_session_unlocked(
-        self,
-        session_id: str,
-        steps: list[dict[str, Any]],
-        id_map: dict[str, str],
-    ) -> None:
-        session_dir = self.paths.sessions_dir / session_id
-        steps_path = session_dir / "steps.jsonl"
-        merkle_path = session_dir / "merkle.sig"
-        meta = self.read_session_meta(session_id)
-        config = self.read_config()
-        store_content = config.get("store_content", ["input", "output", "reasoning", "tool"])
-
-        root = None
-        steps_path.write_text("", encoding="utf-8")
-        prev_step_id = None
-        for step in steps:
-            if "parent_step_id" not in step or step["parent_step_id"] is None:
-                step["parent_step_id"] = prev_step_id
-
-            content = step.pop("_merged_content", None)
-            step.pop("_merged_from", None)
-            if content is not None:
-                content_hash = hash_payload({"content": content})
-                step["content_hash"] = content_hash
-                if step.get("type") == "system_action":
-                    step["content"] = content
-                else:
-                    step.pop("content", None)
-                    if step.get("type") in store_content:
-                        self._write_blob(content_hash, content)
-
-            append_jsonl(steps_path, step)
-            root = chain_hash(step, root)
-            prev_step_id = step["id"]
-
-        remote = self._normalize_remote(dict(meta.get("remote") or {}))
-        mach = remote.setdefault("mach", {})
-        for key in ("last_pushed_step_id", "last_pulled_step_id"):
-            value = mach.get(key)
-            if value in id_map:
-                mach[key] = id_map[value]
-        meta["remote"] = remote
-        meta["head_step_id"] = prev_step_id
-        self._write_session_meta(meta)
-        write_json(merkle_path, {"root": root, "steps": len(steps)})
-        self._replace_session_steps_in_index(session_id, steps)
-
-    def _merge_new_step_into_previous(
-        self,
-        previous: dict[str, Any],
-        current: dict[str, Any],
-        current_content: str,
-        store_content: list[str],
-    ) -> dict[str, Any]:
-        merged = dict(previous)
-        content = self._step_text(previous) + current_content
-        content_hash = hash_payload({"content": content})
-        merged["content_hash"] = content_hash
-        merged["ts"] = current.get("ts", merged.get("ts"))
-        if merged.get("type") == "system_action":
-            merged["content"] = content
-        else:
-            merged.pop("content", None)
-            if merged.get("type") in store_content:
-                self._write_blob(content_hash, content)
-        return merged
-
-    def _rewrite_session_steps_unlocked(self, session_id: str, steps: list[dict[str, Any]]) -> None:
-        session_dir = self.paths.sessions_dir / session_id
-        steps_path = session_dir / "steps.jsonl"
-        merkle_path = session_dir / "merkle.sig"
-
-        root = None
-        steps_path.write_text("", encoding="utf-8")
-        prev_step_id = None
-        for index, step in enumerate(steps, start=1):
-            step["step_num"] = index
-            if "parent_step_id" not in step or step["parent_step_id"] is None:
-                step["parent_step_id"] = prev_step_id
-            append_jsonl(steps_path, step)
-            root = chain_hash(step, root)
-            prev_step_id = step["id"]
-        write_json(merkle_path, {"root": root, "steps": len(steps)})
-
-        try:
-            meta = self.read_session_meta(session_id)
-            meta["head_step_id"] = prev_step_id
-            self._write_session_meta(meta)
-            self._upsert_session_index(meta, len(steps), self._risk_count(session_id))
-        except Exception:
-            pass
-
-        self._replace_session_steps_in_index(session_id, steps)
-
-    def _write_config(self, config: dict[str, Any]) -> None:
-        write_json(self.paths.config_path, config)
-
-    def _write_session_meta(self, meta: dict[str, Any]) -> None:
-        if "remote" in meta:
-            meta["remote"] = self._normalize_remote(dict(meta.get("remote") or {}))
-        write_json(self.paths.sessions_dir / meta["id"] / "meta.json", meta)
-
-    def _read_agent_sessions(self) -> dict[str, str]:
-        return read_json(self.paths.agent_sessions_path)
-
-    def _write_agent_sessions(self, mappings: dict[str, str]) -> None:
-        write_json(self.paths.agent_sessions_path, mappings)
-
-    @staticmethod
-    def _agent_session_key(agent: str, source_session_id: str | None) -> str:
-        return f"{agent}:{source_session_id or 'default'}"
-
     def _ensure_agent_session_unlocked(
         self,
         agent: str,
@@ -1338,32 +773,6 @@ class SessionStore:
         mappings[key] = meta["id"]
         self._write_agent_sessions(mappings)
         return meta["id"]
-
-    def _write_blob(self, content_hash: str, content: str) -> None:
-        if not content or not content_hash:
-            return
-        blob_path = self.paths.blobs_dir / content_hash[:2] / content_hash
-        if not blob_path.exists():
-            blob_path.parent.mkdir(parents=True, exist_ok=True)
-            blob_path.write_text(content, encoding="utf-8")
-
-    def _read_blob(self, content_hash: str) -> str | None:
-        if not content_hash:
-            return None
-        blob_path = self.paths.blobs_dir / content_hash[:2] / content_hash
-        if blob_path.exists():
-            return blob_path.read_text(encoding="utf-8")
-        return None
-
-    def _drop_agent_session_mapping_for_session(self, session_id: str) -> None:
-        mappings = self._read_agent_sessions()
-        updated = {
-            key: value
-            for key, value in mappings.items()
-            if value != session_id
-        }
-        if updated != mappings:
-            self._write_agent_sessions(updated)
 
     def _record_step_for_session_unlocked(self, session_id: str, step_dict: dict[str, Any]) -> dict[str, Any]:
         meta = self.read_session_meta(session_id)
@@ -1390,7 +799,7 @@ class SessionStore:
 
         final_content = None
         if step_type != "system_action" and step_type not in store_content:
-            pass # discard content
+            pass
         elif step_type != "system_action":
             if raw_content:
                 self._write_blob(content_hash, raw_content)
@@ -1406,7 +815,6 @@ class SessionStore:
             if "tool" in store_content and raw_t_content:
                 self._write_blob(t_content_hash, raw_t_content)
                 
-            from mach.models import ToolCall
             tool_obj = ToolCall(
                 name=t.get("name", ""),
                 category=t.get("category", "exec"),
@@ -1414,8 +822,6 @@ class SessionStore:
                 content=None
             )
 
-        from mach.models import Step, FileChange
-        
         fc_data = step_dict.get("file_changes", [])
         file_changes = [FileChange.from_dict(fc) for fc in fc_data] if fc_data else []
 
@@ -1467,172 +873,3 @@ class SessionStore:
             risk_count=self._risk_count(session_id),
         )
         return payload
-
-    def _session_ids(self) -> list[str]:
-        if not self.paths.sessions_dir.exists():
-            return []
-        return [
-            session_dir.name
-            for session_dir in sorted(self.paths.sessions_dir.iterdir())
-            if session_dir.is_dir()
-        ]
-
-    def _upsert_session_index(self, meta: dict[str, Any], step_count: int, risk_count: int) -> None:
-        if not self.get_config().get("db_enabled", True):
-            return
-        with connect(self.paths.db_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO sessions (
-                  id, started_at, ended_at, agent, branch, pre_commit, post_commit,
-                  step_count, risk_count, forked_from, synced_at, agent_session_id, head_step_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                  started_at=excluded.started_at,
-                  ended_at=excluded.ended_at,
-                  agent=excluded.agent,
-                  branch=excluded.branch,
-                  pre_commit=excluded.pre_commit,
-                  post_commit=excluded.post_commit,
-                  step_count=excluded.step_count,
-                  risk_count=excluded.risk_count,
-                  forked_from=excluded.forked_from,
-                  synced_at=excluded.synced_at,
-                  agent_session_id=excluded.agent_session_id,
-                  head_step_id=excluded.head_step_id
-                """,
-                (
-                    meta["id"],
-                    meta["started_at"],
-                    meta["ended_at"],
-                    meta["agent"],
-                    meta["branch"],
-                    meta["pre_commit"],
-                    meta["post_commit"],
-                    step_count,
-                    risk_count,
-                    meta.get("forked_from"),
-                    (meta.get("remote") or {}).get("mach", {}).get("last_pushed_ts"),
-                    meta.get("agent_session_id"),
-                    meta.get("head_step_id"),
-                ),
-            )
-
-    def _insert_step(self, payload: dict[str, Any]) -> None:
-        if not self.get_config().get("db_enabled", True):
-            return
-        with connect(self.paths.db_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO steps (
-                  id, session_id, step_num, ts, type, content, content_hash, caused_by, risk_level, parent_step_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                  parent_step_id=excluded.parent_step_id
-                """,
-                (
-                    payload["id"],
-                    payload["session_id"],
-                    payload["step_num"],
-                    payload["ts"],
-                    payload["type"],
-                    payload.get("content"),
-                    payload.get("content_hash"),
-                    canonical_json(payload.get("caused_by", [])),
-                    payload.get("risk_level", "none"),
-                    payload.get("parent_step_id"),
-                ),
-            )
-
-            tool_payload = payload.get("tool")
-            if tool_payload:
-                conn.execute(
-                    """
-                    INSERT INTO tools (id, step_id, name, category, content, content_hash)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        f"tool_{uuid.uuid4().hex}",
-                        payload["id"],
-                        tool_payload.get("name"),
-                        tool_payload.get("category"),
-                        tool_payload.get("content"),
-                        tool_payload.get("content_hash"),
-                    ),
-                )
-
-            for change in payload.get("file_changes", []):
-                conn.execute(
-                    """
-                    INSERT INTO file_changes (
-                      id, step_id, file_path, action, before_blob, after_blob,
-                      lines_added, lines_removed, hunks, sensitivity
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        f"fc_{uuid.uuid4().hex}",
-                        payload["id"],
-                        change.get("file_path"),
-                        change.get("action"),
-                        change.get("before_blob"),
-                        change.get("after_blob"),
-                        change.get("lines_added"),
-                        change.get("lines_removed"),
-                        canonical_json(change.get("hunks", [])),
-                        change.get("sensitivity", "none"),
-                    ),
-                )
-
-            for flag in payload.get("risk_flags", []):
-                conn.execute(
-                    """
-                    INSERT INTO risk_flags (id, step_id, rule_id, severity, explanation, resolved)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        f"rf_{uuid.uuid4().hex}",
-                        payload["id"],
-                        flag.get("rule_id"),
-                        flag.get("severity"),
-                        flag.get("explanation"),
-                        1 if flag.get("resolved") else 0,
-                    ),
-                )
-
-    def _replace_session_steps_in_index(self, session_id: str, steps: list[dict[str, Any]]) -> None:
-        if not self.get_config().get("db_enabled", True):
-            return
-        with connect(self.paths.db_path) as conn:
-            conn.execute("DELETE FROM risk_flags WHERE step_id IN (SELECT id FROM steps WHERE session_id=?)", (session_id,))
-            conn.execute("DELETE FROM file_changes WHERE step_id IN (SELECT id FROM steps WHERE session_id=?)", (session_id,))
-            conn.execute("DELETE FROM tools WHERE step_id IN (SELECT id FROM steps WHERE session_id=?)", (session_id,))
-            conn.execute("DELETE FROM steps WHERE session_id=?", (session_id,))
-        for step in steps:
-            self._insert_step(step)
-
-    def _step_count(self, session_id: str) -> int:
-        try:
-            with connect(self.paths.db_path) as conn:
-                row = conn.execute(
-                    "SELECT COUNT(*) AS count FROM steps WHERE session_id = ?",
-                    (session_id,),
-                ).fetchone()
-            return int(row["count"]) if row else 0
-        except Exception:
-            return 0
-
-    def _risk_count(self, session_id: str) -> int:
-        try:
-            with connect(self.paths.db_path) as conn:
-                row = conn.execute(
-                    """
-                    SELECT COUNT(*) AS count
-                    FROM risk_flags rf
-                    JOIN steps s ON s.id = rf.step_id
-                    WHERE s.session_id = ?
-                    """,
-                    (session_id,),
-                ).fetchone()
-            return int(row["count"]) if row else 0
-        except Exception:
-            return 0
