@@ -24,9 +24,10 @@ Mach is a high-performance execution tracking system for AI agents. It seamlessl
 Mach is built for uncompromising speed, durability, and a native developer experience:
 
 - **Git-Style Blob Storage:** Massive AI outputs and prompts are hashed and deduplicated into a native blob store (`.mach/blobs/`). This keeps your core JSONL logs ultra-lightweight and blazingly fast to parse.
-- **Lightning TUI & Search:** Drop into a premium, interactive terminal dashboard (`mach log`). Press `/` at any time to execute real-time, instantaneous searches across thousands of AI events and code chunks.
-- **Hybrid Indexing (Toggleable):** Mach uses a fast SQLite FTS5 index (`.mach/index.db`) for sub-millisecond queries. Running on a constrained system? Toggle it off via `--db-enabled false` and Mach will gracefully degrade to pure file-system blob traversal, just like Git.
-- **Zero-Latency Ingestion:** AI events are fired into an asynchronous inbox. A lightweight background daemon processes them into the ledger, ensuring 0ms latency impact on your actual AI workflows.
+- **JSONL-only ledger:** Sessions are append-only `steps.jsonl` files plus content-addressed blobs and a per-session Merkle root — no local SQL database required.
+- **Structured risk engine:** Local rules flag sensitive paths, secret-like content, and dangerous commands as `risk_flags` on each step. Enterprise backends can add more flags later; local and external annotations merge cleanly.
+- **Lightning TUI:** Drop into a premium, interactive terminal dashboard (`mach log`). Press `/` at any time to filter the timeline by tool name, reasoning, or file modifications.
+- **Zero-Latency Ingestion:** AI events are fired into an asynchronous inbox. A lightweight background daemon processes them into the ledger, ensuring minimal latency impact on your actual AI workflows.
 - **Seamless Hooks:** Automatically installs intercepts for terminal-based CLI agents (Claude Code, Copilot CLI, Gemini, Codex, etc).
 
 ## 🚀 Installation
@@ -118,11 +119,14 @@ mach config show
 **To change a configuration:**
 Use the `mach config set` command with the appropriate flags.
 ```bash
-# Example: Disable the SQLite database indexing
-mach config set --db-enabled false
-
 # Example: Disable the TUI and revert to classic terminal logs
 mach config set --use-tui false
+
+# Example: Disable local risk scoring (facts still capture; no risk_flags)
+mach config set --risk-enabled false
+
+# Example: Silence noisy rules
+mach config set --risk-disable-rules TOOL_SHELL_EXEC,PATH_INFRA
 ```
 
 ### Configurable Keys:
@@ -132,11 +136,13 @@ mach config set --use-tui false
 | `auto_session` | `true` | Automatically groups orphan events into active sessions. |
 | `auto_tracking` | `true` | Automatically launches the background daemon when needed. |
 | `use_tui` | `true` | Uses the interactive Textual TUI for `mach log`. Set to `false` for raw text logs. |
-| `db_enabled` | `true` | Enables the SQLite FTS5 database for instant searching. |
 | `hook_agents` | `[...]` | List of AI agents to automatically install intercepts for. |
 | `ignore_paths` | `[...]` | Directories to ignore when calculating file diffs (e.g., `node_modules`). |
 | `poll_interval_sec`| `2` | How often the background daemon checks the inbox. |
 | `store_content` | `["input", "output", "reasoning", "tool"]` | Step types to actively capture and store as blob data. |
+| `risk.enabled` | `true` | Run the local structured risk engine on each recorded step. |
+| `risk.disabled_rules` | `[]` | Built-in or custom `rule_id` values to skip. |
+| `risk.extra_*_patterns` | `[]` | Optional custom path/content/command regex rules (edit via config JSON). |
 
 ## 🔐 Repository Trust Boundary
 
@@ -194,7 +200,7 @@ mach fix
 mach fix --apply
 ```
 
-`mach fix` merges safely mergeable streamed text chunks, normalizes tool-step hashes, recomputes Merkle roots, and rebuilds the SQLite index when applied.
+`mach fix` merges safely mergeable streamed text chunks, normalizes tool-step hashes, recomputes Merkle roots, and repairs meta counters when applied.
 
 ## 💻 Command Reference
 
@@ -210,8 +216,8 @@ mach fix --apply
 ### Session & Event Management
 - `mach log`: Open the interactive TUI.
 - `mach show <session_id>`: Dump raw JSON output of a specific execution timeline.
-- `mach verify`: Cryptographically verify the integrity of the JSONL ledger and Blob hashes.
-- `mach fsck`: Rebuild the SQLite search index from scratch using the raw Blob store.
+- `mach verify`: Cryptographically verify the integrity of the JSONL ledger and Merkle roots.
+- `mach fsck`: Verify JSONL ledgers, blob presence, and repair session meta counters.
 
 ### Daemon Controls & Background Tracking
 - `mach track start|stop|status`: Manage the background ingestion process.

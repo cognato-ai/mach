@@ -15,7 +15,6 @@ class MachPaths:
     config_path: Path
     head_path: Path
     sessions_dir: Path
-    db_path: Path
     pack_dir: Path
     blobs_dir: Path
     lock_path: Path
@@ -73,6 +72,8 @@ class Step:
     content: Optional[str] = None
     caused_by: list[str] = field(default_factory=list)
     risk_level: RiskLevel = "none"
+    # Local RiskEngine + optional enterprise/backend annotations (source=external).
+    risk_flags: list[dict[str, Any]] = field(default_factory=list)
     tool: Optional[ToolCall] = None
     file_changes: list[FileChange] = field(default_factory=list)
     commit_hash: Optional[str] = None
@@ -85,6 +86,8 @@ class Step:
             d.pop("tool", None)
         if not self.file_changes:
             d.pop("file_changes", None)
+        if not self.risk_flags:
+            d.pop("risk_flags", None)
         return {k: v for k, v in d.items() if v is not None}
 
     @classmethod
@@ -105,6 +108,7 @@ class Step:
             content=data.get("content"),
             caused_by=data.get("caused_by", []),
             risk_level=data.get("risk_level", "none"),
+            risk_flags=list(data.get("risk_flags") or []),
             tool=tool,
             file_changes=file_changes,
             commit_hash=data.get("commit_hash"),

@@ -16,26 +16,6 @@ from mach.session import MachError, SessionStore
 from mach.utils import hash_file, read_json, write_json
 
 
-def _severity_rank(value: str) -> int:
-    return {
-        "none": 0,
-        "low": 1,
-        "medium": 2,
-        "high": 3,
-        "critical": 4,
-    }.get(value, 0)
-
-
-def _risk_level_from_severity(value: str) -> str:
-    if value in {"critical", "high"}:
-        return "high"
-    if value == "medium":
-        return "medium"
-    if value == "low":
-        return "low"
-    return "none"
-
-
 class TrackerService:
     def __init__(self, repo_root: Path | None = None) -> None:
         self.paths = resolve_paths(repo_root)
@@ -312,7 +292,6 @@ class TrackerService:
                         "lines_added": None,
                         "lines_removed": None,
                         "hunks": [],
-                        "sensitivity": self._classify_sensitivity(relative),
                     }
                 )
             elif before is not None and after is None:
@@ -325,7 +304,6 @@ class TrackerService:
                         "lines_added": None,
                         "lines_removed": None,
                         "hunks": [],
-                        "sensitivity": self._classify_sensitivity(relative),
                     }
                 )
             elif before is not None and after is not None and before["sha256"] != after["sha256"]:
@@ -338,7 +316,6 @@ class TrackerService:
                         "lines_added": None,
                         "lines_removed": None,
                         "hunks": [],
-                        "sensitivity": self._classify_sensitivity(relative),
                     }
                 )
         return changes
@@ -367,26 +344,17 @@ class TrackerService:
         if len(file_changes) > 5:
             summary = f"{summary}, +{len(file_changes) - 5} more"
 
-        risk_flags: list[dict[str, Any]] = []
-        highest_severity = "none"
-        for change in file_changes:
-            flag = self._risk_flag_for_change(change)
-            if flag:
-                risk_flags.append(flag)
-                if _severity_rank(flag["severity"]) > _severity_rank(highest_severity):
-                    highest_severity = flag["severity"]
-
+        # Risk scoring is enterprise/backend-owned; local capture stays factual only.
         return {
             "type": "tool",
             "content": f"Observed {len(file_changes)} workspace change(s): {summary}",
-            "risk_level": _risk_level_from_severity(highest_severity),
+            "risk_level": "none",
             "tool": {
                 "name": "workspace_observer",
                 "category": "write",
                 "content": summary,
             },
             "file_changes": file_changes,
-            "risk_flags": risk_flags,
         }
 
     @staticmethod
@@ -410,37 +378,6 @@ class TrackerService:
                 "category": "read",
                 "content": summary,
             },
-        }
-
-    @staticmethod
-    def _classify_sensitivity(relative_path: str) -> str:
-        lower = relative_path.lower()
-        if any(token in lower for token in ("auth", "oauth", "jwt", "token", "secret", ".env")):
-            return "auth"
-        if any(token in lower for token in ("terraform", "infra", "docker", "k8s", ".github/workflows")):
-            return "infra"
-        if any(token in lower for token in ("payment", "billing", "invoice", "ledger")):
-            return "financial"
-        if any(token in lower for token in ("pii", "ssn", "passport", "dob")):
-            return "pii"
-        return "none"
-
-    @staticmethod
-    def _risk_flag_for_change(change: dict[str, Any]) -> dict[str, Any] | None:
-        sensitivity = change.get("sensitivity", "none")
-        if sensitivity == "none":
-            return None
-        severity = {
-            "auth": "high",
-            "pii": "high",
-            "infra": "medium",
-            "financial": "high",
-        }.get(sensitivity, "low")
-        return {
-            "rule_id": f"{sensitivity.upper()}_FILE_CHANGE",
-            "severity": severity,
-            "explanation": f"Observed change to sensitive path {change['file_path']}.",
-            "resolved": False,
         }
 
     @staticmethod

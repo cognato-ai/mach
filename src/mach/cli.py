@@ -1145,8 +1145,18 @@ def config_set_command(args: argparse.Namespace) -> None:
         updates["store_content"] = [t.strip() for t in args.store_content.split(",") if t.strip()]
     if args.use_tui is not None:
         updates["use_tui"] = args.use_tui == "true"
-    if args.db_enabled is not None:
-        updates["db_enabled"] = args.db_enabled == "true"
+
+    risk_updates: dict = {}
+    if getattr(args, "risk_enabled", None) is not None:
+        risk_updates["enabled"] = args.risk_enabled == "true"
+    if getattr(args, "risk_disable_rules", None) is not None:
+        risk_updates["disabled_rules"] = [
+            rule.strip() for rule in args.risk_disable_rules.split(",") if rule.strip()
+        ]
+    if risk_updates:
+        risk = dict(current.get("risk") or {})
+        risk.update(risk_updates)
+        updates["risk"] = risk
 
     hook_agents = list(current.get("hook_agents") or [])
     if args.hook_agents is not None:
@@ -1292,9 +1302,11 @@ def internal_fix_command(args: argparse.Namespace) -> None:
 
     if args.apply:
         fsck = store.fsck()
-        print("  Rebuilt SQLite index.")
-        print(f"  Sessions rebuilt: {fsck['sessions_rebuilt']}")
-        print(f"  Steps rebuilt: {fsck['steps_rebuilt']}")
+        print("  Verified JSONL ledgers.")
+        print(f"  Sessions checked: {fsck['sessions_checked']}")
+        print(f"  Steps checked: {fsck['steps_checked']}")
+        if fsck.get("meta_repaired"):
+            print(f"  Meta counters repaired: {fsck['meta_repaired']}")
         if not fsck.get("ok"):
             print("Error: Ledger verification failed after applying fixes.", file=sys.stderr)
             sys.exit(1)
@@ -1494,7 +1506,7 @@ def main() -> None:
     verify_parser.add_argument("session_id", nargs="?")
     verify_parser.set_defaults(handler=verify_command)
 
-    fsck_parser = subparsers.add_parser("fsck", help="Rebuild the SQLite index from JSONL logs.")
+    fsck_parser = subparsers.add_parser("fsck", help="Verify JSONL ledgers, merkle roots, blobs, and meta counters.")
     fsck_parser.set_defaults(handler=fsck_command)
 
     fix_parser = subparsers.add_parser("fix", help="Normalize session ledgers.")
@@ -1589,7 +1601,11 @@ def main() -> None:
     config_set_parser.add_argument("--remove-agent", action="append")
     config_set_parser.add_argument("--store-content", help="Comma-separated step types to store content for (e.g. input,reasoning,tool,output)")
     config_set_parser.add_argument("--use-tui", choices=["true", "false"])
-    config_set_parser.add_argument("--db-enabled", choices=["true", "false"])
+    config_set_parser.add_argument("--risk-enabled", choices=["true", "false"], help="Enable local risk rule evaluation.")
+    config_set_parser.add_argument(
+        "--risk-disable-rules",
+        help="Comma-separated rule_id values to disable (e.g. TOOL_SHELL_EXEC,PATH_INFRA).",
+    )
     config_set_parser.add_argument("--apply", action="store_true", help="Apply current config to hooks and tracker after updating.")
     config_set_parser.add_argument("--refresh-hooks", action="store_true", help="Reinstall managed hooks after updating config.")
     config_set_parser.set_defaults(handler=config_set_command)
