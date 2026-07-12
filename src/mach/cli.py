@@ -790,6 +790,37 @@ def clone_command(args: argparse.Namespace) -> None:
         source_session_id = args.clone_arg
 
     store = SessionStore()
+    agent = getattr(args, "agent", None)
+    resume = bool(getattr(args, "resume", False))
+    force_local = bool(getattr(args, "local", False))
+    force_remote = bool(getattr(args, "remote", False))
+
+    # Local clone when the session already exists (or --local is set).
+    local_exists = (store.paths.sessions_dir / source_session_id).exists()
+    if force_local or (local_exists and not force_remote and repository_name is None):
+        if not local_exists:
+            print(f"Error: Local session '{source_session_id}' not found.", file=sys.stderr)
+            sys.exit(1)
+        print(f"Cloning local session {source_session_id}...")
+        result = store.clone_session(
+            source_session_id,
+            agent=agent,
+            activate=not resume,
+            resume=resume,
+        )
+        print(f"Success: Cloned local session {source_session_id}.")
+        print(f"  New session: {result['session_id']}")
+        print(f"  Forked from: {result['forked_from']}")
+        print(f"  Inherited steps: {result['step_count']}")
+        print(f"  Agent: {result.get('agent') or result.get('metadata', {}).get('agent')}")
+        if result.get("resumed"):
+            print("  Resumed: yes (HEAD + agent bindings set)")
+        if result.get("context") and (resume or getattr(args, "print_context", False)):
+            print("\n--- handoff context ---")
+            print(result["context"].rstrip())
+            print("--- end context ---")
+        return
+
     token = _require_auth_token()
 
     if repository_name:
@@ -811,14 +842,28 @@ def clone_command(args: argparse.Namespace) -> None:
     print(f"Pulling remote session {source_session_id}...")
     remote_steps = _pull_remote_session_steps(store, source_session_id, token)
     remote_blobs = _pull_remote_session_blobs(store, source_session_id, token)
-    result = store.clone_remote_session(source_session_id, session_details, remote_steps, remote_blobs)
+    result = store.clone_remote_session(
+        source_session_id,
+        session_details,
+        remote_steps,
+        remote_blobs,
+        agent=agent,
+        resume=resume or bool(agent),
+    )
     print(f"Success: Cloned session {source_session_id}.")
     print(f"  New session: {result['session_id']}")
     print(f"  Forked from: {result['forked_from']}")
     print(f"  Inherited steps: {result['step_count']}")
     print(f"  Blobs pulled: {result['blob_count']}")
+    print(f"  Agent: {result.get('agent') or result.get('metadata', {}).get('agent')}")
     if result.get("last_pulled_step_id"):
         print(f"  Push cursor: {result['last_pulled_step_id']}")
+    if result.get("resumed"):
+        print("  Resumed: yes (HEAD + agent bindings set)")
+    if result.get("context") and (resume or agent or getattr(args, "print_context", False)):
+        print("\n--- handoff context ---")
+        print(result["context"].rstrip())
+        print("--- end context ---")
 
 
 # This is old pull command (replacement for pull_command) this pulls sessions as well as repository
@@ -1321,8 +1366,71 @@ def rewind_command(args: argparse.Namespace) -> None:
 
 
 def resume_command(args: argparse.Namespace) -> None:
-    store = SessionStore()
-    emit(store.resume_branch(branch=args.branch))
+    from mach.resume_flow import ResumeService, print_resume_ready
+
+    service = ResumeService()
+
+    if getattr(args, "status", False):
+        status = service.status()
+        if getattr(args, "json", False):
+            emit(status)
+            return
+        pending = status.get("pending")
+        if not pending:
+            print("No pending resume.")
+            if status.get("active_session"):
+                print(f"  Active Mach session: {status['active_session']}")
+            return
+        print("Pending / linked resume:")
+        print(f"  Status        : {pending.get('status')}")
+        print(f"  Mach session  : {pending.get('mach_session_id')}")
+        print(f"  Agent         : {pending.get('agent')}")
+        print(f"  Handoff       : {pending.get('handoff_path')}")
+        if pending.get("vendor_session_id"):
+            print(f"  Vendor id     : {pending.get('vendor_session_id')}")
+        if pending.get("resume_command"):
+            print(f"  Resume cmd    : {pending.get('resume_command')}")
+        elif pending.get("start_command"):
+            print(f"  Start cmd     : {pending.get('start_command')}")
+        return
+
+    if getattr(args, "clear_pending", False):
+        service.clear_pending()
+        print("Success: Cleared pending resume state.")
+        return
+
+    session_id = getattr(args, "session_id", None)
+    branch = getattr(args, "branch", None)
+    if session_id and not session_id.startswith("ses_") and session_id != "HEAD" and branch is None:
+        # Positional looked like a branch name (legacy).
+        branch = session_id
+        session_id = None
+
+    agent = getattr(args, "agent", None)
+    if not agent:
+        print("Error: --agent is required (e.g. claude, codex, gemini).", file=sys.stderr)
+        print("       Resume writes a handoff, spawns the agent session, transfers history, and prints the resume command.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        result = service.prepare(
+            session_id=session_id,
+            agent=agent,
+            branch=branch,
+            task_desc=getattr(args, "task_desc", None),
+            progress=not getattr(args, "json", False),
+            spawn=not getattr(args, "no_spawn", False),
+            spawn_timeout_sec=int(getattr(args, "spawn_timeout", 180) or 180),
+        )
+    except MachError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if getattr(args, "json", False):
+        emit(result)
+        return
+
+    print_resume_ready(result)
 
 
 def clean_command(args: argparse.Namespace) -> None:
@@ -1518,8 +1626,43 @@ def main() -> None:
     rewind_parser.add_argument("target", help="Commit hash or branch name to rewind to.")
     rewind_parser.set_defaults(handler=rewind_command)
 
-    resume_parser = subparsers.add_parser("resume", help="Resume latest session on active branch.")
-    resume_parser.add_argument("branch", nargs="?", help="Specific branch to resume on.")
+    resume_parser = subparsers.add_parser(
+        "resume",
+        help="Write handoff, spawn agent session with history, link ids, print resume command.",
+    )
+    resume_parser.add_argument(
+        "session_id",
+        nargs="?",
+        help="Mach session id (ses_...), HEAD, or legacy branch name.",
+    )
+    resume_parser.add_argument("--branch", help="Use latest session on this git branch.")
+    resume_parser.add_argument(
+        "--agent",
+        help="Agent to continue with (claude, codex, gemini). Required unless --status/--clear-pending.",
+    )
+    resume_parser.add_argument("--task-desc", help="Update task description on resume.")
+    resume_parser.add_argument(
+        "--no-spawn",
+        action="store_true",
+        help="Only write handoff + activate Mach session (do not spawn the agent CLI).",
+    )
+    resume_parser.add_argument(
+        "--spawn-timeout",
+        type=int,
+        default=180,
+        help="Seconds to wait for agent spawn/handoff load turn (default 180).",
+    )
+    resume_parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Show pending/linked resume state (handoff path, vendor session id, commands).",
+    )
+    resume_parser.add_argument(
+        "--clear-pending",
+        action="store_true",
+        help="Clear pending resume bind state.",
+    )
+    resume_parser.add_argument("--json", action="store_true", help="Output raw JSON.")
     resume_parser.set_defaults(handler=resume_command)
 
     clean_parser = subparsers.add_parser("clean", help="Clean orphaned AI sessions.")
@@ -1654,9 +1797,32 @@ def main() -> None:
     pull_parser.add_argument("-s", "--session", help="The ID of the session to check.")
     pull_parser.set_defaults(handler=pull_command, repository=None, repository_name=None, session=None, session_id=None)
 
-    clone_parser = subparsers.add_parser("clone", help="Clone a remote session into a new local fork.")
-    clone_parser.add_argument("clone_arg", metavar="repository_or_session", help="Repository name, or the session ID when a repo is already tracked.")
-    clone_parser.add_argument("session_id", nargs="?", help="The session ID to clone.")
+    clone_parser = subparsers.add_parser(
+        "clone",
+        help="Clone a local or remote session into a new fork (optionally resume under any agent).",
+    )
+    clone_parser.add_argument(
+        "clone_arg",
+        metavar="repository_or_session",
+        help="Local/remote session id, or repository name when followed by a session id.",
+    )
+    clone_parser.add_argument("session_id", nargs="?", help="Remote session id when cloning with an explicit repository name.")
+    clone_parser.add_argument("--local", action="store_true", help="Force local clone (session must already exist).")
+    clone_parser.add_argument("--remote", action="store_true", help="Force remote clone even if a local session exists.")
+    clone_parser.add_argument(
+        "--agent",
+        help="Agent/model that will continue this fork (claude, codex, gemini, ...).",
+    )
+    clone_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="After clone, set HEAD and bind agent mappings for immediate continuation.",
+    )
+    clone_parser.add_argument(
+        "--print-context",
+        action="store_true",
+        help="Print a handoff summary to paste into the agent.",
+    )
     clone_parser.set_defaults(handler=clone_command)
 
     update_parser = subparsers.add_parser("update", help="Update the global Mach installation to the latest version.")

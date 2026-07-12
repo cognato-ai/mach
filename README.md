@@ -87,15 +87,27 @@ mach diff <session_id>
 mach push <session_id>
 ```
 
-To work from a remote session, clone it through the repository trust boundary:
+### Clone (remote → Mach) & resume (Mach → agent)
 
 ```bash
-# Pull repository metadata, validate it, and clone the remote session
+# Import a remote session into a local Mach ledger
 mach clone my-repo ses_123
+mach push <new_local_session_id>
 
-# Push only the new steps created in your local fork
-mach push <new_session_id>
+# Mach spawns the agent, transfers the full handoff, links session ids
+mach resume ses_abc123 --agent claude
+# → [1/4] write structured full-chat handoff (no AI summary)
+# → [2/4] activate Mach session
+# → [3/4] spawn claude -p … (agent reads handoff via tools)
+# → [4/4] print only: claude -r <agent_session_id>
+# You do NOT paste context yourself.
+
+mach resume --status          # handoff path + linked vendor id + resume cmd
+mach resume --clear-pending
 ```
+
+`mach resume` owns session creation and handoff transfer. The only user action
+after a successful resume is opening the already-seeded agent session.
 
 ### The TUI Dashboard
 Once Mach is tracking your agents, launch the interactive dashboard:
@@ -207,7 +219,8 @@ mach fix --apply
 ### Setup & Configuration
 - `mach init`: Bootstrap the repository, interactively select hooks and stored content types, and start the daemon.
 - `mach pull --repository <repository_name>`: Validate token access, confirm the remote repository matches this Git checkout, and store the tracked repo locally.
-- `mach clone <repository_name> <session_id>`: Validate the repository, pull the remote session, fork it locally with a new session ID, and push only new fork steps later.
+- `mach clone …`: Import a remote session into a local Mach fork (history only).
+- `mach resume <session_id> --agent <name>`: Write full-chat handoff, activate Mach session, bind next agent session, print start/resume commands.
 - `mach push <session_id>`: Push local session steps and blobs to Mach Web.
 - `mach fix [session_id] --apply`: Normalize session ledgers and rebuild the local index.
 - `mach config show|set`: View or update Mach configuration (e.g. `mach config set --db-enabled false`).

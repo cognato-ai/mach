@@ -65,7 +65,32 @@ class GeminiHookAdapter(HookAdapter):
                 event={"kind": "session_end", "agent": self.name, "source_session_id": str(session_id) if session_id else None},
             )
         if event_name == "SessionStart":
-            return self._step(session_id, "reasoning", "Gemini session started", "{}")
+            inject = ""
+            try:
+                from mach.resume_flow import ResumeService
+                from mach.session import SessionStore
+
+                bind = ResumeService(SessionStore(repo_root)).on_agent_session_start(
+                    self.name,
+                    str(session_id) if session_id else None,
+                )
+                inject = bind.get("inject") or ""
+            except Exception:
+                inject = ""
+            content = "Gemini session started"
+            if inject:
+                content = f"{content}\n\n{inject}"
+            # Gemini expects JSON on stdout for empty-json mode; keep "{}" and log inject in step.
+            return HookDispatchResult(
+                handled=True,
+                emitted_output="{}",
+                event={
+                    "kind": "step",
+                    "agent": self.name,
+                    "source_session_id": str(session_id) if session_id else None,
+                    "step": {"type": "system_action", "content": content},
+                },
+            )
         if event_name == "UserPromptSubmit":
             prompt = first_present(payload, "prompt") or nested_first_present(payload, ("hook_input", "prompt"))
             return self._step(session_id, "input", str(prompt or ""), "{}")

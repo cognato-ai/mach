@@ -519,50 +519,228 @@ class SessionStore:
         }
 
     def resume_branch(self, branch: str | None = None) -> dict[str, Any]:
+        """Resume the latest session on a git branch (compat wrapper)."""
+        return self.resume_session(branch=branch)
+
+    def resume_session(
+        self,
+        session_id: str | None = None,
+        *,
+        agent: str | None = None,
+        fork: bool | None = None,
+        branch: str | None = None,
+        source_session_id: str | None = None,
+        task_desc: str | None = None,
+        print_context: bool = False,
+    ) -> dict[str, Any]:
+        """Resume a session, optionally forking and/or switching agent/model.
+
+        Auto-fork when ``fork`` is None and either:
+          - the session has ended, or
+          - ``agent`` is set and differs from the session's current agent.
+
+        After resume, HEAD points at the active session and agent mappings are
+        wired so the next hook events from that agent continue this ledger.
+        """
         self.init_repo()
         with file_lock(self.paths.lock_path):
-            target_branch = branch or current_branch(self.paths.repo_root)
-            candidates = [
-                meta
-                for meta in (self.read_session_meta(sid) for sid in self._session_ids())
-                if meta.get("branch") == target_branch
-            ]
-            candidates.sort(key=lambda item: item.get("started_at") or 0, reverse=True)
-            if not candidates:
-                raise MachError(f"No previous sessions found for branch: {target_branch}")
+            source_id = self._resolve_resume_source(session_id=session_id, branch=branch)
+            source_meta = self.read_session_meta(source_id)
+            previous_agent = source_meta.get("agent") or "unknown"
+            target_agent = (agent or previous_agent or "unknown").strip() or "unknown"
+            agent_changed = bool(agent) and target_agent != previous_agent
+            source_ended = source_meta.get("status") != "active"
 
-            meta = candidates[0]
-            session_id = meta["id"]
-            if meta["status"] != "active":
-                meta["status"] = "active"
-                meta["ended_at"] = None
-                meta["post_commit"] = None
-                self._refresh_meta_counts(meta, session_id)
-                self._write_session_meta(meta)
-                self._record_step_for_session_unlocked(session_id, {
+            should_fork = fork if fork is not None else (source_ended or agent_changed)
+            forked = False
+            active_id = source_id
+
+            if should_fork:
+                clone_result = self._clone_session_unlocked(
+                    source_id,
+                    agent=target_agent,
+                    activate=False,
+                    task_desc=task_desc or source_meta.get("task_desc"),
+                )
+                active_id = clone_result["session_id"]
+                forked = True
+
+            meta = self._activate_session_unlocked(
+                active_id,
+                agent=target_agent,
+                source_session_id=source_session_id,
+                task_desc=task_desc,
+            )
+
+            reason_parts = []
+            if forked:
+                reason_parts.append(f"forked from {source_id}")
+            if agent_changed:
+                reason_parts.append(f"agent {previous_agent} -> {target_agent}")
+            if source_ended and not forked:
+                reason_parts.append("reopened ended session")
+            if not reason_parts:
+                reason_parts.append("continued")
+
+            handoff = self._build_resume_context_unlocked(active_id)
+            self._record_step_for_session_unlocked(
+                active_id,
+                {
                     "type": "system_action",
-                    "content": f"Session resumed on branch {target_branch}",
+                    "content": (
+                        f"Session resumed ({', '.join(reason_parts)}).\n\n"
+                        f"{handoff}"
+                    ),
                     "risk_level": "none",
-                })
-                meta = self.read_session_meta(session_id)
+                },
+            )
+            meta = self.read_session_meta(active_id)
 
-            self.paths.head_path.write_text(session_id, encoding="utf-8")
-
-            agent = meta.get("agent")
-            agent_sid = meta.get("agent_session_id")
-            if agent:
-                mappings = self._read_agent_sessions()
-                key = self._agent_session_key(agent, agent_sid)
-                mappings[key] = session_id
-                self._write_agent_sessions(mappings)
-
-            return {
+            result: dict[str, Any] = {
                 "status": "resumed",
-                "session_id": session_id,
-                "agent_session_id": agent_sid,
-                "agent": agent,
+                "session_id": active_id,
+                "forked": forked,
+                "forked_from": source_id if forked else source_meta.get("forked_from"),
+                "agent": target_agent,
+                "previous_agent": previous_agent,
+                "agent_session_id": meta.get("agent_session_id"),
+                "source_session_id": source_id,
                 "metadata": meta,
             }
+            if print_context or forked or agent_changed:
+                result["context"] = handoff
+            return result
+
+    def _resolve_resume_source(
+        self,
+        *,
+        session_id: str | None,
+        branch: str | None,
+    ) -> str:
+        if session_id == "HEAD":
+            active = self.get_active_session_id()
+            if not active or not (self.paths.sessions_dir / active).exists():
+                raise MachError("No active session (HEAD is empty).")
+            return active
+
+        if session_id:
+            if not (self.paths.sessions_dir / session_id).exists():
+                raise MachError(f"Unknown session: {session_id}")
+            return session_id
+
+        # No explicit session: prefer active HEAD when not filtering by branch.
+        if branch is None:
+            active = self.get_active_session_id()
+            if active and (self.paths.sessions_dir / active).exists():
+                return active
+
+        target_branch = branch or current_branch(self.paths.repo_root)
+        candidates = [
+            meta
+            for meta in (self.read_session_meta(sid) for sid in self._session_ids())
+            if meta.get("branch") == target_branch
+        ]
+        candidates.sort(key=lambda item: item.get("started_at") or 0, reverse=True)
+        if not candidates:
+            raise MachError(f"No previous sessions found for branch: {target_branch}")
+        return candidates[0]["id"]
+
+    def _activate_session_unlocked(
+        self,
+        session_id: str,
+        *,
+        agent: str,
+        source_session_id: str | None = None,
+        task_desc: str | None = None,
+        resume_pending: bool = True,
+    ) -> dict[str, Any]:
+        """Mark session active, set HEAD, and bind agent mappings for resume."""
+        meta = self.read_session_meta(session_id)
+        meta["status"] = "active"
+        meta["ended_at"] = None
+        meta["post_commit"] = None
+        meta["agent"] = agent
+        # Clear vendor id unless explicitly provided; first hook rebinds it.
+        meta["agent_session_id"] = source_session_id
+        if task_desc is not None:
+            meta["task_desc"] = task_desc
+        # Accept the next vendor session id from this agent into this ledger.
+        meta["resume_pending"] = bool(resume_pending)
+        self._refresh_meta_counts(meta, session_id)
+        self._write_session_meta(meta)
+        self.paths.head_path.write_text(session_id, encoding="utf-8")
+
+        # Drop stale bindings that pointed at this session for other agents, then
+        # bind this agent (default + optional vendor id) so hooks continue here.
+        mappings = self._read_agent_sessions()
+        cleaned = {
+            key: value
+            for key, value in mappings.items()
+            if value != session_id
+        }
+        cleaned[self._agent_session_key(agent, None)] = session_id
+        if source_session_id:
+            cleaned[self._agent_session_key(agent, source_session_id)] = session_id
+        self._write_agent_sessions(cleaned)
+        return meta
+
+    def build_resume_context(self, session_id: str, *, max_steps: int = 40) -> str:
+        self.init_repo()
+        if not (self.paths.sessions_dir / session_id).exists():
+            raise MachError(f"Unknown session: {session_id}")
+        with file_lock(self.paths.lock_path):
+            return self._build_resume_context_unlocked(session_id, max_steps=max_steps)
+
+    def _build_resume_context_unlocked(self, session_id: str, *, max_steps: int = 40) -> str:
+        meta = self.read_session_meta(session_id)
+        steps = read_jsonl(self.paths.sessions_dir / session_id / "steps.jsonl")
+        task = meta.get("task_desc") or "(none)"
+        agent = meta.get("agent") or "unknown"
+        branch = meta.get("branch") or "?"
+        lines = [
+            "## Mach session handoff",
+            f"- session: {session_id}",
+            f"- forked_from: {meta.get('forked_from') or 'n/a'}",
+            f"- agent: {agent}",
+            f"- branch: {branch}",
+            f"- task: {task}",
+            f"- steps: {len(steps)}",
+            "",
+            "Continue this work. Prior execution trail (most recent last):",
+            "",
+        ]
+
+        relevant = [
+            step
+            for step in steps
+            if step.get("type") in {"input", "output", "reasoning", "tool", "system_action"}
+        ][-max_steps:]
+
+        for step in relevant:
+            stype = step.get("type", "?")
+            prefix = f"[{stype}]"
+            if stype == "tool":
+                tool = step.get("tool") or {}
+                name = tool.get("name") or "tool"
+                body = tool.get("content")
+                if body is None and tool.get("content_hash"):
+                    body = self._read_blob(tool.get("content_hash"))
+                text = (body or step.get("content") or "")[:500]
+                files = [
+                    fc.get("file_path")
+                    for fc in (step.get("file_changes") or [])
+                    if isinstance(fc, dict) and fc.get("file_path")
+                ]
+                file_note = f" files={','.join(files[:8])}" if files else ""
+                lines.append(f"{prefix} {name}{file_note}: {text}".rstrip())
+            else:
+                body = step.get("content")
+                if body is None and step.get("content_hash"):
+                    body = self._read_blob(step.get("content_hash"))
+                text = (body or "")[:500]
+                if text:
+                    lines.append(f"{prefix} {text}")
+        return "\n".join(lines).strip() + "\n"
 
     def rewind(self, target: str) -> dict[str, Any]:
         self.init_repo()
@@ -723,100 +901,165 @@ class SessionStore:
             self._write_session_meta(meta)
             return meta
 
-    def clone_session(self, source_session_id: str) -> dict[str, Any]:
+    def clone_session(
+        self,
+        source_session_id: str,
+        *,
+        agent: str | None = None,
+        activate: bool = True,
+        task_desc: str | None = None,
+        resume: bool = False,
+        source_agent_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Fork a local session. Optionally activate / resume under any agent."""
         self.init_repo()
         with file_lock(self.paths.lock_path):
-            source_dir = self.paths.sessions_dir / source_session_id
-            if not source_dir.exists():
-                raise MachError(f"Unknown session: {source_session_id}")
+            result = self._clone_session_unlocked(
+                source_session_id,
+                agent=agent,
+                activate=activate and not resume,
+                task_desc=task_desc,
+            )
+            if resume:
+                activated = self._activate_session_unlocked(
+                    result["session_id"],
+                    agent=(agent or result["metadata"].get("agent") or "unknown"),
+                    source_session_id=source_agent_session_id,
+                    task_desc=task_desc,
+                )
+                handoff = self._build_resume_context_unlocked(result["session_id"])
+                self._record_step_for_session_unlocked(
+                    result["session_id"],
+                    {
+                        "type": "system_action",
+                        "content": (
+                            f"Session cloned and resumed for agent {activated.get('agent')}.\n\n"
+                            f"{handoff}"
+                        ),
+                        "risk_level": "none",
+                    },
+                )
+                result["resumed"] = True
+                result["agent"] = activated.get("agent")
+                result["metadata"] = self.read_session_meta(result["session_id"])
+                result["context"] = handoff
+            return result
 
-            source_meta = self.read_session_meta(source_session_id)
-            source_steps = read_jsonl(source_dir / "steps.jsonl")
-            source_merkle = read_json(source_dir / "merkle.sig")
+    def _clone_session_unlocked(
+        self,
+        source_session_id: str,
+        *,
+        agent: str | None = None,
+        activate: bool = True,
+        task_desc: str | None = None,
+    ) -> dict[str, Any]:
+        source_dir = self.paths.sessions_dir / source_session_id
+        if not source_dir.exists():
+            raise MachError(f"Unknown session: {source_session_id}")
 
-            clone_id = f"ses_{uuid.uuid4().hex}"
-            clone_dir = self.paths.sessions_dir / clone_id
-            clone_dir.mkdir(parents=True, exist_ok=False)
+        source_meta = self.read_session_meta(source_session_id)
+        source_steps = read_jsonl(source_dir / "steps.jsonl")
+        source_merkle = read_json(source_dir / "merkle.sig")
 
-            now = int(time())
-            remote = self._normalize_remote(dict(source_meta.get("remote") or {}))
-            last_inherited_step_id: str | None = None
-            id_map: dict[str, str] = {}
-            cloned_steps: list[dict[str, Any]] = []
+        clone_id = f"ses_{uuid.uuid4().hex}"
+        clone_dir = self.paths.sessions_dir / clone_id
+        clone_dir.mkdir(parents=True, exist_ok=False)
 
-            for index, step in enumerate(source_steps, start=1):
-                cloned = dict(step)
-                original_step_id = str(cloned.get("id") or "")
-                cloned_step_id = f"step_{uuid.uuid4().hex}"
-                if original_step_id:
-                    id_map[original_step_id] = cloned_step_id
+        now = int(time())
+        remote = self._normalize_remote(dict(source_meta.get("remote") or {}))
+        last_inherited_step_id: str | None = None
+        id_map: dict[str, str] = {}
+        cloned_steps: list[dict[str, Any]] = []
 
-                original_causes = list(cloned.get("caused_by") or [])
-                cloned["id"] = cloned_step_id
-                cloned["session_id"] = clone_id
-                cloned["step_num"] = index
-                cloned["_original_caused_by"] = original_causes
-                cloned_steps.append(cloned)
-                last_inherited_step_id = cloned_step_id
+        for index, step in enumerate(source_steps, start=1):
+            cloned = dict(step)
+            original_step_id = str(cloned.get("id") or "")
+            cloned_step_id = f"step_{uuid.uuid4().hex}"
+            if original_step_id:
+                id_map[original_step_id] = cloned_step_id
 
-            for cloned in cloned_steps:
-                caused_by = cloned.pop("_original_caused_by", [])
-                mapped = [id_map.get(step_id, step_id) for step_id in caused_by if step_id]
-                if not mapped and cloned["step_num"] > 1:
-                    mapped = [cloned_steps[cloned["step_num"] - 2]["id"]]
-                cloned["caused_by"] = mapped
-                
-                # Also map parent_step_id to the cloned step's parent
-                old_parent = cloned.get("parent_step_id")
-                if old_parent:
-                    cloned["parent_step_id"] = id_map.get(old_parent, old_parent)
+            original_causes = list(cloned.get("caused_by") or [])
+            cloned["id"] = cloned_step_id
+            cloned["session_id"] = clone_id
+            cloned["step_num"] = index
+            cloned["_original_caused_by"] = original_causes
+            cloned_steps.append(cloned)
+            last_inherited_step_id = cloned_step_id
 
-            mach_state = remote.setdefault("mach", {})
-            mach_state.update({
-                "last_pushed_step_id": last_inherited_step_id,
-                "last_pushed_ts": now if last_inherited_step_id else 0,
-                "last_pulled_step_id": last_inherited_step_id,
-                "last_pulled_ts": now if last_inherited_step_id else 0,
-                "last_pulled_at": str(now) if last_inherited_step_id else None,
-                "forked_from_session_id": source_session_id,
-                "forked_from_root": source_merkle.get("root"),
-            })
+        for cloned in cloned_steps:
+            caused_by = cloned.pop("_original_caused_by", [])
+            mapped = [id_map.get(step_id, step_id) for step_id in caused_by if step_id]
+            if not mapped and cloned["step_num"] > 1:
+                mapped = [cloned_steps[cloned["step_num"] - 2]["id"]]
+            cloned["caused_by"] = mapped
 
-            cloned_meta = dict(source_meta)
-            cloned_meta.update({
-                "id": clone_id,
-                "started_at": now,
-                "ended_at": None,
-                "status": "active",
-                "branch": current_branch(self.paths.repo_root),
-                "pre_commit": head_commit(self.paths.repo_root),
-                "post_commit": None,
-                "forked_from": source_session_id,
-                "remote": remote,
-                "head_step_id": last_inherited_step_id,
-                "step_count": len(cloned_steps),
-                "risk_count": self._risk_count_from_steps(cloned_steps),
-            })
+            old_parent = cloned.get("parent_step_id")
+            if old_parent:
+                cloned["parent_step_id"] = id_map.get(old_parent, old_parent)
 
-            root = None
-            for cloned in cloned_steps:
-                append_jsonl(clone_dir / "steps.jsonl", cloned)
-                root = chain_hash(cloned, root)
-            if not cloned_steps:
-                (clone_dir / "steps.jsonl").touch()
-            self._write_session_meta(cloned_meta)
-            write_json(clone_dir / "merkle.sig", {"root": root, "steps": len(cloned_steps)})
+        mach_state = remote.setdefault("mach", {})
+        mach_state.update({
+            "last_pushed_step_id": last_inherited_step_id,
+            "last_pushed_ts": now if last_inherited_step_id else 0,
+            "last_pulled_step_id": last_inherited_step_id,
+            "last_pulled_ts": now if last_inherited_step_id else 0,
+            "last_pulled_at": str(now) if last_inherited_step_id else None,
+            "forked_from_session_id": source_session_id,
+            "forked_from_root": source_merkle.get("root"),
+        })
 
-            self.paths.head_path.write_text(clone_id, encoding="utf-8")
+        target_agent = agent or source_meta.get("agent") or "unknown"
+        cloned_meta = dict(source_meta)
+        cloned_meta.update({
+            "id": clone_id,
+            "started_at": now,
+            "ended_at": None,
+            "status": "active",
+            "agent": target_agent,
+            # New fork waits for the target agent to bind its vendor session id.
+            "agent_session_id": None,
+            "branch": current_branch(self.paths.repo_root),
+            "pre_commit": head_commit(self.paths.repo_root),
+            "post_commit": None,
+            "forked_from": source_session_id,
+            "remote": remote,
+            "head_step_id": last_inherited_step_id,
+            "step_count": len(cloned_steps),
+            "risk_count": self._risk_count_from_steps(cloned_steps),
+            "task_desc": task_desc if task_desc is not None else source_meta.get("task_desc"),
+            "resume_pending": bool(activate),
+        })
 
-            return {
-                "cloned": True,
-                "session_id": clone_id,
-                "forked_from": source_session_id,
-                "step_count": len(cloned_steps),
-                "last_pulled_step_id": last_inherited_step_id,
-                "metadata": cloned_meta,
-            }
+        root = None
+        for cloned in cloned_steps:
+            append_jsonl(clone_dir / "steps.jsonl", cloned)
+            root = chain_hash(cloned, root)
+        if not cloned_steps:
+            (clone_dir / "steps.jsonl").touch()
+        self._write_session_meta(cloned_meta)
+        write_json(clone_dir / "merkle.sig", {"root": root, "steps": len(cloned_steps)})
+
+        if activate:
+            self._activate_session_unlocked(
+                clone_id,
+                agent=target_agent,
+                source_session_id=None,
+                task_desc=cloned_meta.get("task_desc"),
+            )
+            cloned_meta = self.read_session_meta(clone_id)
+        else:
+            # Still set HEAD if activate was requested via older callers.
+            pass
+
+        return {
+            "cloned": True,
+            "session_id": clone_id,
+            "forked_from": source_session_id,
+            "step_count": len(cloned_steps),
+            "last_pulled_step_id": last_inherited_step_id,
+            "agent": target_agent,
+            "metadata": cloned_meta,
+        }
 
     def clone_remote_session(
         self,
@@ -824,6 +1067,9 @@ class SessionStore:
         details: PullSessionDetails,
         source_steps: list[dict[str, Any]],
         source_blobs: list[dict[str, Any]] | None = None,
+        *,
+        agent: str | None = None,
+        resume: bool = False,
     ) -> dict[str, Any]:
         self.init_repo()
         with file_lock(self.paths.lock_path):
@@ -906,23 +1152,25 @@ class SessionStore:
                 "forked_from_root": details.merkle_root,
             })
 
+            target_agent = agent or details.agent_name or "unknown"
             cloned_meta = SessionMeta(
                 id=clone_id,
                 started_at=now,
                 ended_at=None,
-                agent=details.agent_name or "unknown",
+                agent=target_agent,
                 branch=current_branch(self.paths.repo_root) or details.branch or "main",
                 remote=RemoteInfo.from_dict(remote),
                 pre_commit=head_commit(self.paths.repo_root),
                 post_commit=None,
                 task_desc=details.task_desc,
                 status="active",
-                agent_session_id=details.agent_session_id,
+                agent_session_id=None if resume or agent else details.agent_session_id,
                 forked_from=source_session_id,
                 head_step_id=last_inherited_step_id,
                 step_count=len(cloned_steps),
                 risk_count=self._risk_count_from_steps(cloned_steps),
             ).to_dict()
+            cloned_meta["resume_pending"] = bool(resume or agent)
 
             root = None
             for cloned in cloned_steps:
@@ -933,17 +1181,44 @@ class SessionStore:
             self._write_session_meta(cloned_meta)
             write_json(clone_dir / "merkle.sig", {"root": root, "steps": len(cloned_steps)})
 
-            self.paths.head_path.write_text(clone_id, encoding="utf-8")
-
-            return {
+            result = {
                 "cloned": True,
                 "session_id": clone_id,
                 "forked_from": source_session_id,
                 "step_count": len(cloned_steps),
                 "blob_count": blob_count,
                 "last_pulled_step_id": last_inherited_step_id,
+                "agent": target_agent,
                 "metadata": cloned_meta,
             }
+
+            if resume or agent:
+                activated = self._activate_session_unlocked(
+                    clone_id,
+                    agent=target_agent,
+                    source_session_id=None,
+                    task_desc=details.task_desc,
+                )
+                handoff = self._build_resume_context_unlocked(clone_id)
+                self._record_step_for_session_unlocked(
+                    clone_id,
+                    {
+                        "type": "system_action",
+                        "content": (
+                            f"Remote session cloned and ready for agent {target_agent}.\n\n"
+                            f"{handoff}"
+                        ),
+                        "risk_level": "none",
+                    },
+                )
+                result["resumed"] = True
+                result["agent"] = activated.get("agent")
+                result["metadata"] = self.read_session_meta(clone_id)
+                result["context"] = handoff
+            else:
+                self.paths.head_path.write_text(clone_id, encoding="utf-8")
+
+            return result
 
     def _write_remote_blobs_unlocked(self, blobs: list[dict[str, Any]]) -> int:
         written = 0
@@ -1312,16 +1587,80 @@ class SessionStore:
         mappings = self._read_agent_sessions()
         key = self._agent_session_key(agent, source_session_id)
         session_id = mappings.get(key)
+
+        # Fall back to agent:default binding established by `mach resume` / clone --resume.
+        if not session_id:
+            session_id = mappings.get(self._agent_session_key(agent, None))
+
         if session_id and (self.paths.sessions_dir / session_id / "meta.json").exists():
             meta = self.read_session_meta(session_id)
             if meta.get("status") == "active":
+                self._bind_vendor_session_if_needed(
+                    session_id,
+                    meta,
+                    agent=agent,
+                    source_session_id=source_session_id,
+                    mappings=mappings,
+                    key=key,
+                )
                 self.paths.head_path.write_text(session_id, encoding="utf-8")
                 return session_id
+
+        # Resume pending on HEAD: attach any vendor session for this agent to that ledger.
+        active = self.get_active_session_id()
+        if active and (self.paths.sessions_dir / active / "meta.json").exists():
+            meta = self.read_session_meta(active)
+            if (
+                meta.get("status") == "active"
+                and meta.get("agent") == agent
+                and meta.get("resume_pending")
+            ):
+                self._bind_vendor_session_if_needed(
+                    active,
+                    meta,
+                    agent=agent,
+                    source_session_id=source_session_id,
+                    mappings=mappings,
+                    key=key,
+                )
+                return active
 
         meta = self._create_session_unlocked(agent=agent, task_desc=task_desc, agent_session_id=source_session_id)
         mappings[key] = meta["id"]
         self._write_agent_sessions(mappings)
         return meta["id"]
+
+    def _bind_vendor_session_if_needed(
+        self,
+        session_id: str,
+        meta: dict[str, Any],
+        *,
+        agent: str,
+        source_session_id: str | None,
+        mappings: dict[str, str],
+        key: str,
+    ) -> None:
+        """Attach a vendor agent session id to a resumed Mach session."""
+        changed = False
+        if mappings.get(key) != session_id:
+            mappings[key] = session_id
+            changed = True
+        default_key = self._agent_session_key(agent, None)
+        if mappings.get(default_key) != session_id:
+            mappings[default_key] = session_id
+            changed = True
+        if changed:
+            self._write_agent_sessions(mappings)
+
+        meta_changed = False
+        if source_session_id and meta.get("agent_session_id") != source_session_id:
+            meta["agent_session_id"] = source_session_id
+            meta_changed = True
+        if meta.get("resume_pending"):
+            meta["resume_pending"] = False
+            meta_changed = True
+        if meta_changed:
+            self._write_session_meta(meta)
 
     def _write_blob(self, content_hash: str, content: str) -> None:
         if not content or not content_hash:
