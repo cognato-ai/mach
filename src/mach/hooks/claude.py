@@ -29,7 +29,10 @@ class ClaudeHookAdapter(HookAdapter):
         hooks = strip_matching_commands(read_json_file(self.settings_path), "mach hooks dispatch --agent claude")
         command = command_name()
         additions = {
-            "SessionStart": [self._event_entry(f'{command} hooks dispatch --agent claude --event SessionStart')],
+            # passthrough: SessionStart stdout can inject handoff instructions into Claude.
+            "SessionStart": [self._event_entry(
+                f'{command} hooks dispatch --agent claude --event SessionStart --stdout-mode passthrough'
+            )],
             "SessionEnd": [self._event_entry(f'{command} hooks dispatch --agent claude --event SessionEnd')],
             "UserPromptSubmit": [self._event_entry(f'{command} hooks dispatch --agent claude --event UserPromptSubmit')],
             "Stop": [self._event_entry(f'{command} hooks dispatch --agent claude --event Stop')],
@@ -69,13 +72,29 @@ class ClaudeHookAdapter(HookAdapter):
                 event={"kind": "session_end", "agent": self.name, "source_session_id": str(session_id) if session_id else None},
             )
         if event_name == "SessionStart":
+            inject = ""
+            try:
+                from mach.resume_flow import ResumeService
+                from mach.session import SessionStore
+
+                bind = ResumeService(SessionStore(repo_root)).on_agent_session_start(
+                    self.name,
+                    str(session_id) if session_id else None,
+                )
+                inject = bind.get("inject") or ""
+            except Exception:
+                inject = ""
+            content = "Claude session started"
+            if inject:
+                content = f"{content}\n\n{inject}"
             return HookDispatchResult(
                 handled=True,
+                emitted_output=inject,
                 event={
                     "kind": "step",
                     "agent": self.name,
                     "source_session_id": str(session_id) if session_id else None,
-                    "step": {"type": "reasoning", "content": "Claude session started"},
+                    "step": {"type": "system_action", "content": content},
                 },
             )
         if event_name == "UserPromptSubmit":

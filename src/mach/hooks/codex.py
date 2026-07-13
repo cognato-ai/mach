@@ -71,7 +71,31 @@ class CodexHookAdapter(HookAdapter):
     def dispatch(self, event_name: str, payload: dict[str, Any], repo_root: Path) -> HookDispatchResult:
         session_id = first_present(payload, "session_id", "sessionId")
         if event_name == "SessionStart":
-            return self._step(session_id, "reasoning", "Codex session started")
+            inject = ""
+            try:
+                from mach.resume_flow import ResumeService
+                from mach.session import SessionStore
+
+                bind = ResumeService(SessionStore(repo_root)).on_agent_session_start(
+                    self.name,
+                    str(session_id) if session_id else None,
+                )
+                inject = bind.get("inject") or ""
+            except Exception:
+                inject = ""
+            content = "Codex session started"
+            if inject:
+                content = f"{content}\n\n{inject}"
+            return HookDispatchResult(
+                handled=True,
+                emitted_output=inject,
+                event={
+                    "kind": "step",
+                    "agent": self.name,
+                    "source_session_id": str(session_id) if session_id else None,
+                    "step": {"type": "system_action", "content": content},
+                },
+            )
         if event_name == "UserPromptSubmit":
             prompt = first_present(payload, "prompt", "content")
             return self._step(session_id, "input", str(prompt or ""))
