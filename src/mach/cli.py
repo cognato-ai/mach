@@ -1126,35 +1126,73 @@ def _agent_provider(agent_name: str) -> str:
 
 
 
-def update_command(_: argparse.Namespace) -> None:
+def update_command(args: argparse.Namespace) -> None:
     import subprocess
+
     install_dir = Path.home() / ".mach"
     if not install_dir.exists() or not (install_dir / ".git").exists():
         print("Error: Mach is not installed globally at ~/.mach or is not a git repository.", file=sys.stderr)
         sys.exit(1)
-        
-    print("Updating Mach...")
+
+    if getattr(args, "dev", False) and getattr(args, "test", False):
+        print("Error: Use only one of --dev or --test.", file=sys.stderr)
+        sys.exit(1)
+
+    if getattr(args, "dev", False):
+        branch = "dev"
+    elif getattr(args, "test", False):
+        branch = "test"
+    else:
+        branch = getattr(args, "branch", None) or "master"
+
+    print(f"Updating Mach from origin/{branch}...")
     try:
+        # Fetch latest refs, check out the requested branch, then hard-align to remote.
         subprocess.check_call(
-            ["git", "pull", "origin", "master"],
+            ["git", "fetch", "origin", branch],
             cwd=str(install_dir),
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
         )
-        
-        # Also update the python environment if it exists
+        # Create local branch tracking origin if needed; otherwise switch to it.
+        local_branches = subprocess.check_output(
+            ["git", "branch", "--list", branch],
+            cwd=str(install_dir),
+            text=True,
+        ).strip()
+        if local_branches:
+            subprocess.check_call(
+                ["git", "checkout", branch],
+                cwd=str(install_dir),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            subprocess.check_call(
+                ["git", "checkout", "-B", branch, f"origin/{branch}"],
+                cwd=str(install_dir),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        subprocess.check_call(
+            ["git", "reset", "--hard", f"origin/{branch}"],
+            cwd=str(install_dir),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
         venv_pip = install_dir / "venv" / "bin" / "pip"
         if venv_pip.exists():
             subprocess.check_call(
                 [str(venv_pip), "install", "--upgrade", "."],
                 cwd=str(install_dir),
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
+                stderr=subprocess.DEVNULL,
             )
-            
-        print("Success: Mach updated successfully.")
+
+        print(f"Success: Mach updated from origin/{branch}.")
     except subprocess.CalledProcessError:
-        print("Error: Failed to update Mach.", file=sys.stderr)
+        print(f"Error: Failed to update Mach from origin/{branch}.", file=sys.stderr)
         sys.exit(1)
 
 
@@ -1825,7 +1863,26 @@ def main() -> None:
     )
     clone_parser.set_defaults(handler=clone_command)
 
-    update_parser = subparsers.add_parser("update", help="Update the global Mach installation to the latest version.")
+    update_parser = subparsers.add_parser(
+        "update",
+        help="Update the global Mach installation (~/.mach) from origin.",
+    )
+    update_channel = update_parser.add_mutually_exclusive_group()
+    update_channel.add_argument(
+        "--dev",
+        action="store_true",
+        help="Update from the dev branch (origin/dev).",
+    )
+    update_channel.add_argument(
+        "--test",
+        action="store_true",
+        help="Update from the test branch (origin/test).",
+    )
+    update_channel.add_argument(
+        "--branch",
+        metavar="NAME",
+        help="Update from an arbitrary origin branch (default: master).",
+    )
     update_parser.set_defaults(handler=update_command)
 
     try:
