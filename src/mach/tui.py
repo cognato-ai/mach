@@ -1,8 +1,7 @@
 """
-mach.tui — Premium interactive terminal dashboard.
+mach.tui — Interactive execution ledger dashboard.
 
-Native terminal aesthetics.
-Split-screen: sessions (left) | timeline (right). Enter → step detail modal.
+Dense, high-contrast layout: sessions rail | timeline | live preview.
 """
 from __future__ import annotations
 
@@ -12,20 +11,17 @@ import time as _time
 from collections import Counter
 from typing import Any
 
+from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
-from textual.widgets import DataTable, Footer, ListItem, ListView, Static, Input
-from rich.text import Text
+from textual.widgets import DataTable, Footer, Input, ListItem, ListView, Static
 
 from mach.session import SessionStore
 
-
-# ══════════════════════════════════════════════════════════
-#  Constants & helpers
-# ══════════════════════════════════════════════════════════
+# ── helpers ──────────────────────────────────────────────────────────────────
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\\033\[[0-9;]*[A-Za-z]")
 
@@ -36,21 +32,21 @@ def _strip(text: str) -> str:
 
 def _rel(ts: int) -> str:
     if not ts:
-        return "?"
+        return "—"
     d = max(0, int(_time.time()) - ts)
     if d < 60:
-        return f"{d}s ago"
+        return f"{d}s"
     if d < 3600:
-        return f"{d // 60}m ago"
+        return f"{d // 60}m"
     if d < 86400:
-        return f"{d // 3600}h ago"
-    return f"{d // 86400}d ago"
+        return f"{d // 3600}h"
+    return f"{d // 86400}d"
 
 
 def _abs_ts(ts: int) -> str:
     if not ts:
         return ""
-    return _time.strftime("%b %d  %H:%M", _time.localtime(ts))
+    return _time.strftime("%b %d %H:%M", _time.localtime(ts))
 
 
 def _coalesce(steps: list[dict]) -> list[dict]:
@@ -60,55 +56,75 @@ def _coalesce(steps: list[dict]) -> list[dict]:
         tool = step.get("tool")
         content = step.get("content", "")
         if tool:
-            name = tool.get("name")
-            out.append(dict(
-                id=step["id"], ts=step.get("ts", 0), type="tool",
-                name=name, category=tool.get("category", "exec"),
-                content=_strip(tool.get("content") or ""),
-                file_changes=step.get("file_changes"), count=1,
-            ))
+            out.append(
+                dict(
+                    id=step["id"],
+                    ts=step.get("ts", 0),
+                    type="tool",
+                    name=tool.get("name"),
+                    category=tool.get("category", "exec"),
+                    content=_strip(tool.get("content") or ""),
+                    file_changes=step.get("file_changes"),
+                    risk_flags=step.get("risk_flags"),
+                    risk_level=step.get("risk_level"),
+                    count=1,
+                )
+            )
             continue
         if stype == "reasoning" and out and out[-1]["type"] == "reasoning":
             out[-1]["content"] = (out[-1].get("content") or "") + (content or "")
             out[-1].update(id=step["id"], ts=step.get("ts", 0))
         else:
-            out.append(dict(id=step["id"], ts=step.get("ts", 0),
-                            type=stype, content=_strip(content or "")))
+            out.append(
+                dict(
+                    id=step["id"],
+                    ts=step.get("ts", 0),
+                    type=stype,
+                    content=_strip(content or ""),
+                    file_changes=step.get("file_changes"),
+                    risk_flags=step.get("risk_flags"),
+                    risk_level=step.get("risk_level"),
+                )
+            )
     return out
 
 
-# visual config using native terminal colors
+# Step type → glyph + rich style
 STEP_ICON = {
-    "input":         ("▸", "bold cyan"),
-    "reasoning":     ("◆", "bold magenta"),
-    "tool":          ("⬡", "bold yellow"),
-    "output":        ("◀", "bold green"),
-    "system_action": ("·", "dim"),
+    "input": ("▶", "bold #34d399"),
+    "reasoning": ("◆", "bold #c084fc"),
+    "tool": ("⚙", "bold #fbbf24"),
+    "output": ("◀", "bold #38bdf8"),
+    "system_action": ("◇", "dim #94a3b8"),
 }
+
 TOOL_CAT_ICON = {"write": "✎", "read": "≡", "search": "⌕", "exec": "❯"}
+
+# Agent brand colors
 AGENT_COLOR = {
-    "gemini":  "cyan",
-    "claude":  "yellow",
-    "codex":   "green",
-    "copilot": "magenta",
-    "cursor":  "blue",
-}
-
-ACCENT_STYLES = {
-    "blue": ("blue", "bold blue"),
-    "cyan": ("cyan", "bold cyan"),
-    "green": ("green", "bold green"),
-    "yellow": ("yellow", "bold yellow"),
-    "magenta": ("magenta", "bold magenta"),
+    "claude": "#f59e0b",
+    "gemini": "#60a5fa",
+    "codex": "#34d399",
+    "copilot": "#a78bfa",
+    "cursor": "#38bdf8",
+    "workspace-observer": "#94a3b8",
+    "workspace_observer": "#94a3b8",
 }
 
 
-def _short_id(value: str, prefix: str, size: int = 12) -> str:
-    return value.replace(prefix, "")[:size]
+def _agent_style(agent: str) -> str:
+    return AGENT_COLOR.get(str(agent).lower(), "#e2e8f0")
+
+
+def _short_id(value: str, prefix: str, size: int = 8) -> str:
+    raw = str(value or "")
+    if raw.startswith(prefix):
+        raw = raw[len(prefix) :]
+    return raw[:size]
 
 
 def _short_commit(value: str | None) -> str:
-    return (value or "?")[:7]
+    return (value or "—")[:7]
 
 
 def _count_file_changes(step: dict[str, Any]) -> int:
@@ -119,82 +135,267 @@ def _session_status(session: dict[str, Any]) -> str:
     return session.get("status") or ("active" if not session.get("ended_at") else "ended")
 
 
-def _accent_from_env() -> str:
-    override = os.environ.get("MACH_TUI_ACCENT", "").strip().lower()
-    if override in ACCENT_STYLES:
-        return override
-
-    term_program = os.environ.get("TERM_PROGRAM", "").lower()
-    if "apple_terminal" in term_program:
-        return "green"
-    if "vscode" in term_program:
-        return "blue"
-    if "warp" in term_program:
-        return "yellow"
-    if "wezterm" in term_program:
-        return "cyan"
-
-    if os.environ.get("KITTY_WINDOW_ID"):
-        return "magenta"
-    if os.environ.get("WT_SESSION"):
-        return "blue"
-    if os.environ.get("ITERM_PROFILE"):
-        return "cyan"
-    return "cyan"
-
-
-def _preview_text(step: dict[str, Any], width: int = 136) -> str:
+def _preview_text(step: dict[str, Any], width: int = 100) -> str:
     if step.get("type") == "tool":
-        tool_bits = [
-            step.get("name", "?"),
-            str(step.get("content") or "").strip().replace("\n", " "),
-        ]
-        value = "  ".join(bit for bit in tool_bits if bit)
+        bits = [step.get("name", "?"), str(step.get("content") or "").strip().replace("\n", " ")]
+        value = "  ".join(b for b in bits if b)
     else:
         value = str(step.get("content") or "").strip().replace("\n", " ")
     value = _strip(value)
     if not value:
-        return "(content redacted)"
+        return "(no content stored)"
     return value if len(value) <= width else value[: width - 1] + "…"
+
+
+# Shared dark theme tokens used across screens
+_APP_CSS = """
+/* ── palette ─────────────────────────────────────────── */
+$bg: #0b0f14;
+$surface: #111827;
+$panel: #0f172a;
+$border: #1e293b;
+$border-hi: #334155;
+$text: #e2e8f0;
+$muted: #64748b;
+$accent: #22d3ee;
+$accent-dim: #0891b2;
+$ok: #34d399;
+$warn: #fbbf24;
+$danger: #f87171;
+$purple: #c084fc;
+
+Screen {
+    background: $bg;
+    color: $text;
+}
+
+/* ── top bar ─────────────────────────────────────────── */
+#topbar {
+    dock: top;
+    height: 3;
+    background: $panel;
+    border-bottom: tall $border-hi;
+    padding: 0 2;
+    layout: horizontal;
+}
+#brand {
+    width: 1fr;
+    height: 3;
+    content-align: left middle;
+}
+#stats-bar {
+    width: auto;
+    height: 3;
+    content-align: right middle;
+}
+
+/* ── main split ──────────────────────────────────────── */
+#main {
+    height: 1fr;
+}
+#rail {
+    width: 36;
+    min-width: 30;
+    max-width: 42;
+    height: 1fr;
+    background: $surface;
+    border-right: tall $border-hi;
+}
+#workspace {
+    width: 1fr;
+    height: 1fr;
+    background: $bg;
+}
+
+.section-head {
+    height: 1;
+    background: $panel;
+    color: $muted;
+    padding: 0 1;
+    text-style: bold;
+    border-bottom: solid $border;
+}
+
+/* sessions */
+ListView {
+    height: 1fr;
+    background: transparent;
+    padding: 0;
+    border: none;
+    scrollbar-background: $surface;
+    scrollbar-color: $border-hi;
+}
+ListView:focus {
+    border: none;
+}
+ListItem {
+    height: 5;
+    padding: 0 1;
+    background: transparent;
+    border-bottom: solid $border;
+}
+ListItem.--highlight {
+    background: #164e63 40%;
+    border-left: outer $accent;
+}
+ListItem:hover {
+    background: #1e293b 60%;
+}
+
+#session-detail {
+    height: 9;
+    background: $panel;
+    border-top: solid $border-hi;
+    padding: 1 1;
+}
+
+/* timeline */
+#timeline-head {
+    height: 1;
+    background: $panel;
+    border-bottom: solid $border;
+    padding: 0 1;
+}
+#chips {
+    height: 1;
+    background: $surface;
+    padding: 0 1;
+    border-bottom: solid $border;
+}
+#step-search-input {
+    height: 1;
+    background: $surface;
+    border: none;
+    padding: 0 1;
+    color: $text;
+}
+#step-search-input:focus {
+    background: #164e63 30%;
+}
+#step-search-input > .input--placeholder {
+    color: $muted;
+}
+
+DataTable {
+    height: 1fr;
+    background: transparent;
+    padding: 0 0;
+    scrollbar-background: $bg;
+    scrollbar-color: $border-hi;
+}
+DataTable > .datatable--header {
+    background: $panel;
+    color: $muted;
+    text-style: bold;
+}
+DataTable > .datatable--cursor {
+    background: #164e63 55%;
+}
+DataTable > .datatable--hover {
+    background: #1e293b 50%;
+}
+DataTable > .datatable--even-row {
+    background: transparent;
+}
+DataTable > .datatable--odd-row {
+    background: #0f172a 40%;
+}
+
+#preview {
+    height: 6;
+    background: $panel;
+    border-top: solid $border-hi;
+    padding: 0 1;
+}
+
+Footer {
+    background: $panel;
+    border-top: solid $border-hi;
+    color: $muted;
+    height: 1;
+}
+Footer > .footer--key {
+    background: $accent-dim;
+    color: $bg;
+    text-style: bold;
+}
+Footer > .footer--description {
+    color: $muted;
+}
+
+/* modal */
+StepDetail {
+    align: center middle;
+    background: #000000 65%;
+}
+#modal-shell {
+    width: 88%;
+    height: 84%;
+    background: $surface;
+    border: tall $accent-dim;
+    padding: 0;
+}
+#modal-top {
+    height: auto;
+    background: $panel;
+    border-bottom: solid $border-hi;
+    padding: 1 2;
+}
+#modal-scroll {
+    height: 1fr;
+    padding: 1 2;
+    scrollbar-color: $border-hi;
+}
+#modal-bottom {
+    height: 1;
+    background: $panel;
+    border-top: solid $border;
+    padding: 0 2;
+    content-align: left middle;
+}
+
+/* diff screen */
+DiffScreen {
+    background: $bg;
+}
+#diff-top {
+    height: 3;
+    background: $panel;
+    border-bottom: tall $border-hi;
+    padding: 0 2;
+    content-align: left middle;
+}
+#diff-body {
+    height: 1fr;
+}
+#diff-left {
+    width: 40%;
+    height: 1fr;
+    background: $surface;
+    border-right: tall $border-hi;
+}
+#diff-right {
+    width: 1fr;
+    height: 1fr;
+    padding: 1 2;
+    background: $bg;
+}
+#diff-bottom {
+    height: 1;
+    background: $panel;
+    border-top: solid $border;
+    padding: 0 2;
+}
+"""
 
 
 # ══════════════════════════════════════════════════════════
 #  Step Detail Modal
 # ══════════════════════════════════════════════════════════
 
-class StepDetail(ModalScreen[None]):
-    BINDINGS = [Binding("escape,q", "dismiss", "Close")]
 
-    DEFAULT_CSS = """
-    StepDetail {
-        align: center middle;
-        background: $background 70%;
-    }
-    #modal-outer {
-        width: 85%;
-        height: 82%;
-        background: $surface;
-        border: round $primary;
-        padding: 0;
-    }
-    #modal-header {
-        height: auto;
-        background: $panel;
-        border-bottom: solid $primary;
-        padding: 1 2;
-    }
-    #modal-body {
-        height: 1fr;
-        padding: 1 2;
-    }
-    #modal-footer-bar {
-        height: 1;
-        background: $panel;
-        border-top: solid $primary;
-        padding: 0 2;
-        content-align: left middle;
-    }
-    """
+class StepDetail(ModalScreen[None]):
+    BINDINGS = [Binding("escape,q", "dismiss", "Close", show=True)]
 
     def __init__(self, step: dict, agent: str) -> None:
         super().__init__()
@@ -205,24 +406,21 @@ class StepDetail(ModalScreen[None]):
         s = self.step
         stype = s.get("type", "unknown")
         icon, ic = STEP_ICON.get(stype, ("·", "dim"))
-        label = stype.upper()
         ts = s.get("ts", 0)
-        acol = AGENT_COLOR.get(self.agent.lower(), "white")
+        acol = _agent_style(self.agent)
 
-        with Vertical(id="modal-outer"):
-            # ── Header ──
-            with Container(id="modal-header"):
+        with Vertical(id="modal-shell"):
+            with Container(id="modal-top"):
                 h = Text()
-                h.append(f"  {icon} ", style=ic)
-                h.append(f"{label}", style=f"bold {ic.split()[-1] if ' ' in ic else ic}")
+                h.append(f"{icon} ", style=ic)
+                h.append(f"{stype.upper()}", style=ic)
                 h.append("   ", style="dim")
-                h.append("step:", style="dim")
-                h.append(f" {s.get('id', '?')}", style="blue")
-                h.append("   agent:", style="dim")
-                h.append(f" {self.agent}", style=f"bold {acol}")
+                h.append(_short_id(str(s.get("id", "")), "step_", 14), style="#60a5fa")
+                h.append("  ·  ", style="dim")
+                h.append(self.agent, style=f"bold {acol}")
                 if ts:
-                    h.append(f"   {_abs_ts(ts)}", style="dim")
-                    h.append(f"  ({_rel(ts)})", style="dim")
+                    h.append(f"  ·  {_abs_ts(ts)}", style="#64748b")
+                    h.append(f"  ({_rel(ts)} ago)", style="#475569")
                 yield Static(h)
 
                 if stype == "tool":
@@ -230,61 +428,83 @@ class StepDetail(ModalScreen[None]):
                     ci = TOOL_CAT_ICON.get(cat, "·")
                     count = s.get("count", 1)
                     t2 = Text()
-                    t2.append(f"  {ci} ", style="yellow")
-                    t2.append(s.get("name", "?"), style="bold yellow")
-                    t2.append(f"  [{cat}]", style="dim")
+                    t2.append(f"{ci} ", style="#fbbf24")
+                    t2.append(str(s.get("name", "?")), style="bold #fbbf24")
+                    t2.append(f"  {cat}", style="#64748b")
                     if count > 1:
-                        t2.append(f"  ×{count} calls", style="dim yellow")
+                        t2.append(f"  ×{count}", style="#fbbf24")
+                    risk = s.get("risk_level") or "none"
+                    if risk and risk != "none":
+                        t2.append(f"  ·  risk:{risk}", style="#f87171")
                     yield Static(t2)
 
-            # ── Body ──
-            with VerticalScroll(id="modal-body"):
+            with VerticalScroll(id="modal-scroll"):
                 content = _strip(s.get("content") or "").strip()
                 if content:
-                    yield Static(Text(content))
+                    for line in content.splitlines():
+                        yield Static(Text(line, style="#e2e8f0"))
                 else:
-                    yield Static(Text("  (no content stored — privacy policy redacted)", style="dim italic"))
+                    yield Static(Text("(no content stored)", style="italic #64748b"))
 
-                fc = s.get("file_changes")
+                fc = s.get("file_changes") or []
                 if fc:
                     yield Static(Text(""))
                     sep = Text()
-                    sep.append("  ── ", style="dim")
-                    sep.append("File Changes", style="bold")
-                    sep.append(f"  ({len(fc)} file{'s' if len(fc) != 1 else ''})", style="dim")
+                    sep.append("── ", style="#334155")
+                    sep.append("FILE CHANGES", style="bold #22d3ee")
+                    sep.append(f"  {len(fc)}", style="#64748b")
                     yield Static(sep)
-                    yield Static(Text(""))
                     for ch in fc:
                         action = ch.get("action", "write")
                         fp = ch.get("file_path", "?")
                         added = ch.get("lines_added", 0) or 0
                         removed = ch.get("lines_removed", 0) or 0
-                        astyle = {"write": "green", "read": "cyan",
-                                  "delete": "red"}.get(action, "dim")
+                        astyle = {"write": "#34d399", "read": "#38bdf8", "delete": "#f87171"}.get(
+                            action, "#64748b"
+                        )
                         line = Text()
-                        line.append(f"  {action.upper():<6}", style=f"bold {astyle}")
-                        line.append(f"  {fp}", style="white")
+                        line.append(f"{action.upper():<6} ", style=f"bold {astyle}")
+                        line.append(str(fp), style="#e2e8f0")
                         if added or removed:
-                            line.append(f"  +{added}", style="green")
-                            line.append(f"  -{removed}", style="red")
+                            line.append(f"  +{added}", style="#34d399")
+                            line.append(f" -{removed}", style="#f87171")
                         yield Static(line)
                         for h in ch.get("hunks", []):
                             hs, he = h.get("from", 0), h.get("to", 0)
                             hl = Text()
-                            hl.append(f"        @@ -{hs},{max(1,he-hs+1)} +{hs},{max(1,he-hs+1)} @@",
-                                      style="cyan")
+                            hl.append(
+                                f"       @@ -{hs},{max(1, he - hs + 1)} +{hs},{max(1, he - hs + 1)} @@",
+                                style="#22d3ee",
+                            )
                             yield Static(hl)
 
-            # ── Footer ──
+                flags = s.get("risk_flags") or []
+                if flags:
+                    yield Static(Text(""))
+                    sep = Text()
+                    sep.append("── ", style="#334155")
+                    sep.append("RISK FLAGS", style="bold #f87171")
+                    yield Static(sep)
+                    for flag in flags:
+                        if not isinstance(flag, dict):
+                            continue
+                        rl = Text()
+                        rl.append(f"  {flag.get('severity', '?').upper():<8}", style="bold #f87171")
+                        rl.append(str(flag.get("rule_id", "?")), style="#fbbf24")
+                        if flag.get("explanation"):
+                            rl.append(f"  {flag['explanation']}", style="#94a3b8")
+                        yield Static(rl)
+
             foot = Text()
-            foot.append("  ESC ", style="bold yellow")
-            foot.append("close", style="dim")
-            yield Static(foot, id="modal-footer-bar")
+            foot.append(" esc ", style="bold #0b0f14 on #22d3ee")
+            foot.append(" close", style="#64748b")
+            yield Static(foot, id="modal-bottom")
 
 
 # ══════════════════════════════════════════════════════════
 #  Diff Screen
 # ══════════════════════════════════════════════════════════
+
 
 class DiffScreen(Screen):
     BINDINGS = [
@@ -292,53 +512,6 @@ class DiffScreen(Screen):
         Binding("d", "quit", "Close"),
         Binding("r", "refresh", "Refresh"),
     ]
-
-    DEFAULT_CSS = """
-    DiffScreen {
-        background: $background;
-    }
-    #diff-container {
-        height: 1fr;
-    }
-    #files-pane {
-        width: 42%;
-        height: 1fr;
-        border-right: tall $primary;
-        background: transparent;
-    }
-    .pane-title {
-        height: 2;
-        padding: 0 2;
-        border-bottom: solid $primary;
-        background: $panel;
-        content-align: left middle;
-    }
-    DataTable {
-        height: 1fr;
-        background: transparent;
-        padding: 0 1;
-    }
-    #details-pane {
-        width: 1fr;
-        height: 1fr;
-        padding: 0 2 1 2;
-        background: transparent;
-    }
-    #diff-header {
-        height: 3;
-        background: $panel;
-        border-bottom: solid $primary;
-        padding: 0 2;
-        content-align: left middle;
-    }
-    #diff-footer {
-        height: 1;
-        background: $panel;
-        border-top: solid $primary;
-        padding: 0 2;
-        content-align: left middle;
-    }
-    """
 
     def __init__(self, session_id: str, store: SessionStore) -> None:
         super().__init__()
@@ -349,53 +522,72 @@ class DiffScreen(Screen):
 
     def compose(self) -> ComposeResult:
         self._load_diff_data()
-
         meta = self.diff_data.get("meta") or {}
         agent = str(meta.get("agent", "unknown"))
         sid = _short_id(str(meta.get("id", "")), "ses_")
         branch = str(meta.get("branch", "?"))
+        acol = _agent_style(agent)
 
         header = Text()
-        header.append("\u25e1 ", style="bold white")
-        header.append("DIFF", style="bold cyan")
-        header.append(f"  {sid}", style="blue")
-        header.append("  ", style="dim")
-        header.append(f"{agent}  ", style="bold yellow")
-        header.append(f"on {branch}", style="cyan")
+        header.append(" ▸ ", style="bold #22d3ee")
+        header.append("DIFF", style="bold #22d3ee")
+        header.append(f"  {sid}", style="#60a5fa")
+        header.append("  ·  ", style="#334155")
+        header.append(agent, style=f"bold {acol}")
+        header.append(f"  on {branch}", style="#22d3ee")
+        header.append("  ·  ", style="#334155")
+        header.append(f"{self.diff_data.get('files_changed', 0)} files", style="#e2e8f0")
+        header.append(
+            f"  +{self.diff_data.get('total_added', 0)}",
+            style="#34d399",
+        )
+        header.append(
+            f" -{self.diff_data.get('total_removed', 0)}",
+            style="#f87171",
+        )
+        yield Static(header, id="diff-top")
 
-        yield Static(header, id="diff-header")
-
-        with Horizontal(id="diff-container"):
-            with Vertical(id="files-pane"):
-                yield Static("File-Changing Steps", classes="pane-title")
-                yield DataTable(id="diff-files-table", cursor_type="row",
-                                zebra_stripes=True, show_cursor=True)
-
-            with VerticalScroll(id="details-pane"):
-                detail_placeholder = Text("Select a step to see details", style="dim italic")
-                yield Static(detail_placeholder, id="diff-detail-content")
+        with Horizontal(id="diff-body"):
+            with Vertical(id="diff-left"):
+                yield Static(Text(" STEPS WITH FILE CHANGES", style="bold #64748b"), classes="section-head")
+                yield DataTable(
+                    id="diff-files-table",
+                    cursor_type="row",
+                    zebra_stripes=True,
+                    show_cursor=True,
+                )
+            with VerticalScroll(id="diff-right"):
+                yield Static(
+                    Text("Select a step →", style="italic #64748b"),
+                    id="diff-detail-content",
+                )
 
         footer = Text()
-        footer.append("q/esc/d ", style="bold yellow")
-        footer.append("close  \u00b7  ", style="dim")
-        footer.append("\u2191\u2193 ", style="bold yellow")
-        footer.append("navigate  \u00b7  ", style="dim")
-        footer.append("enter ", style="bold yellow")
-        footer.append("focus", style="dim")
-        yield Static(footer, id="diff-footer")
+        footer.append(" q/esc ", style="bold #0b0f14 on #22d3ee")
+        footer.append(" close  ", style="#64748b")
+        footer.append(" ↑↓ ", style="bold #0b0f14 on #334155")
+        footer.append(" navigate", style="#64748b")
+        yield Static(footer, id="diff-bottom")
 
     def on_mount(self) -> None:
         table = self.query_one("#diff-files-table", DataTable)
-        table.add_columns("Step", "Tool / Type", "Files", "+/-")
+        table.add_columns("Step", "Tool", "Files", "+/−")
         self._populate_steps_table()
 
     def _load_diff_data(self) -> None:
         try:
             self.diff_data = self.store.session_diff(self.session_id)
         except Exception:
-            self.diff_data = {"meta": {}, "steps": [], "files": [], "files_changed": 0,
-                              "total_added": 0, "total_removed": 0,
-                              "tool_calls": 0, "tool_names": {}}
+            self.diff_data = {
+                "meta": {},
+                "steps": [],
+                "files": [],
+                "files_changed": 0,
+                "total_added": 0,
+                "total_removed": 0,
+                "tool_calls": 0,
+                "tool_names": {},
+            }
 
     def _populate_steps_table(self) -> None:
         table = self.query_one("#diff-files-table", DataTable)
@@ -407,7 +599,7 @@ class DiffScreen(Screen):
             tool_or_type = step.get("tool_name") or step.get("step_type", "?")
             table.add_row(
                 _short_id(str(step.get("step_id", "")), "step_", 10),
-                tool_or_type,
+                str(tool_or_type),
                 file_label,
                 self._delta_label(step.get("lines_added", 0), step.get("lines_removed", 0)),
             )
@@ -417,47 +609,48 @@ class DiffScreen(Screen):
 
     def _detail_text(self, idx: int) -> Text:
         if not (0 <= idx < len(self.steps)):
-            return Text("Select a step to see details", style="dim italic")
+            return Text("Select a step →", style="italic #64748b")
         step = self.steps[idx]
         files = step.get("files") or []
 
         detail = Text()
         step_id = str(step.get("step_id") or "")
-        detail.append(_short_id(step_id, "step_", 16), style="bold blue")
+        detail.append(_short_id(step_id, "step_", 16), style="bold #60a5fa")
         detail.append("  ")
-        detail.append(step.get("step_type", "?"), style="bold white")
+        detail.append(str(step.get("step_type", "?")).upper(), style="bold #e2e8f0")
         if step.get("tool_name"):
             detail.append("  ")
-            detail.append(step["tool_name"], style="yellow")
+            detail.append(step["tool_name"], style="#fbbf24")
         if step.get("ts"):
             detail.append("  ")
-            detail.append(_abs_ts(int(step["ts"])), style="dim")
-        detail.append("\n")
+            detail.append(_abs_ts(int(step["ts"])), style="#64748b")
+        detail.append("\n\n")
 
-        detail.append("Files:  ", style="dim")
-        detail.append(str(step.get("files_changed", len(files))), style="bold white")
-        detail.append("    Lines:  ", style="dim")
+        detail.append("Files ", style="#64748b")
+        detail.append(str(step.get("files_changed", len(files))), style="bold #e2e8f0")
+        detail.append("   Lines ", style="#64748b")
         self._append_delta(detail, step.get("lines_added", 0), step.get("lines_removed", 0))
-        detail.append("    Source:  ", style="dim")
+        detail.append("   Source ", style="#64748b")
         source = step.get("diff_source", "recorded")
-        detail.append(source, style="cyan" if source == "git" else "white")
+        detail.append(source, style="#22d3ee" if source == "git" else "#e2e8f0")
         detail.append("\n")
 
         content = _strip(step.get("content") or "").strip()
         if content:
-            detail.append("\nStep content:\n", style="bold")
-            preview = content if len(content) <= 700 else content[:700].rstrip() + "\n..."
+            detail.append("\n", style="")
+            detail.append("CONTENT\n", style="bold #22d3ee")
+            preview = content if len(content) <= 700 else content[:700].rstrip() + "\n…"
             for line in preview.splitlines():
-                detail.append(f"  {line}\n", style="dim")
+                detail.append(f"  {line}\n", style="#94a3b8")
 
         if not files:
-            detail.append("\nNo file details were recorded for this step.", style="dim")
+            detail.append("\nNo file details recorded for this step.", style="#64748b")
             return detail
 
-        detail.append("\nFiles changed by this step:\n", style="bold")
+        detail.append("\n", style="")
+        detail.append("FILES\n", style="bold #22d3ee")
         for file_change in files:
             self._append_file_change(detail, file_change)
-
         return detail
 
     def _append_file_change(self, detail: Text, f: dict) -> None:
@@ -469,42 +662,42 @@ class DiffScreen(Screen):
         diff_source = f.get("diff_source") or ("recorded" if hunks else "summary")
 
         detail.append("\n")
-        detail.append(f.get("file_path", "?"), style="bold white")
+        detail.append(str(f.get("file_path", "?")), style="bold #e2e8f0")
         detail.append("  ")
-        detail.append(action, style="yellow")
+        detail.append(str(action), style="#fbbf24")
         detail.append("  ")
         self._append_delta(detail, added, removed)
         detail.append("  ")
-        detail.append(diff_source, style="cyan" if diff_source == "git" else "dim")
+        detail.append(str(diff_source), style="#22d3ee" if diff_source == "git" else "#64748b")
         detail.append("\n")
         if hunks:
-            detail.append("  Recorded hunks:\n", style="bold")
+            detail.append("  Hunks\n", style="bold #64748b")
             for i, h in enumerate(hunks, 1):
                 from_line = h.get("from", 0)
                 to_line = h.get("to", 0)
-                detail.append(f"    hunk {i}: ", style="dim")
-                detail.append(f"@@ -{from_line} +{to_line} @@\n", style="cyan")
+                detail.append(f"    {i}. ", style="#475569")
+                detail.append(f"@@ -{from_line} +{to_line} @@\n", style="#22d3ee")
         elif git_diff:
-            detail.append("  Git diff fallback:\n", style="bold cyan")
+            detail.append("  Git diff\n", style="bold #22d3ee")
             self._append_patch(detail, git_diff)
         else:
-            detail.append("  No hunk details were recorded for this file.\n", style="dim")
+            detail.append("  No hunk details recorded.\n", style="#64748b")
 
     def _append_delta(self, detail: Text, added: int, removed: int) -> None:
-        detail.append(f"+{added} ", style="green" if added else "dim")
-        detail.append(f"-{removed}", style="red" if removed else "dim")
+        detail.append(f"+{added} ", style="#34d399" if added else "#475569")
+        detail.append(f"-{removed}", style="#f87171" if removed else "#475569")
 
     def _delta_label(self, added: int, removed: int) -> str:
-        delta = []
+        parts = []
         if added:
-            delta.append(f"+{added}")
+            parts.append(f"+{added}")
         if removed:
-            delta.append(f"-{removed}")
-        return " ".join(delta) or "-"
+            parts.append(f"-{removed}")
+        return " ".join(parts) or "·"
 
     def _step_file_label(self, files: list[dict]) -> str:
         if not files:
-            return "-"
+            return "·"
         if len(files) == 1:
             return str(files[0].get("file_path") or "?")
         return f"{len(files)} files"
@@ -512,20 +705,20 @@ class DiffScreen(Screen):
     def _append_patch(self, detail: Text, patch: str, limit: int = 220) -> None:
         lines = patch.splitlines()
         for line in lines[:limit]:
-            style = "white"
+            style = "#e2e8f0"
             if line.startswith("+++ ") or line.startswith("--- "):
-                style = "dim"
+                style = "#64748b"
             elif line.startswith("@@"):
-                style = "cyan"
+                style = "#22d3ee"
             elif line.startswith("+"):
-                style = "green"
+                style = "#34d399"
             elif line.startswith("-"):
-                style = "red"
+                style = "#f87171"
             elif line.startswith("diff --git"):
-                style = "bold blue"
+                style = "bold #60a5fa"
             detail.append(line + "\n", style=style)
         if len(lines) > limit:
-            detail.append(f"... {len(lines) - limit} more line(s)\n", style="dim")
+            detail.append(f"… {len(lines) - limit} more line(s)\n", style="#64748b")
 
     def action_quit(self) -> None:
         if self.app.__class__.__name__ == "DiffOnlyApp":
@@ -552,291 +745,232 @@ class DiffScreen(Screen):
             self.query_one("#diff-detail-content", Static).update(self._detail_text(row))
 
 
+# ══════════════════════════════════════════════════════════
+#  Main App
+# ══════════════════════════════════════════════════════════
+
+
 class MachApp(App):
     TITLE = "mach"
     SUB_TITLE = "execution ledger"
-
-    CSS = """
-    Screen {
-        background: transparent;
-    }
-    #hero {
-        dock: top;
-        height: 4;
-        border-bottom: tall $primary;
-        padding: 0 2;
-    }
-    #hero-left, #hero-right {
-        height: 4;
-        content-align: left middle;
-    }
-    #hero-left {
-        width: 1fr;
-    }
-    #hero-right {
-        width: 38;
-        content-align: right middle;
-    }
-    #split {
-        margin: 1 0 0 0;
-    }
-    .pane-title {
-        height: 2;
-        padding: 0 1;
-        border-bottom: solid $primary;
-        content-align: left middle;
-    }
-    .subpanel {
-        height: auto;
-        border-top: solid $surface-lighten-1;
-        padding: 1 1 1 1;
-    }
-    #split {
-        height: 1fr;
-    }
-    #session-pane {
-        width: 42;
-        min-width: 34;
-        height: 1fr;
-        border-right: tall $primary;
-        background: transparent;
-    }
-    ListView {
-        height: 1fr;
-        background: transparent;
-        padding: 0;
-        border: none;
-    }
-    ListView:focus {
-        border: none;
-    }
-    ListItem {
-        height: 6;
-        padding: 1 1;
-        border-bottom: solid $surface-lighten-1;
-        background: transparent;
-    }
-    ListItem.--highlight {
-        background: $boost;
-        border-left: thick $accent;
-    }
-    ListItem:hover {
-        background: $boost;
-    }
-    #steps-pane {
-        width: 1fr;
-        height: 1fr;
-        background: transparent;
-    }
-    DataTable {
-        height: 1fr;
-        background: transparent;
-        padding: 0 1;
-    }
-    DataTable > .datatable--header {
-        background: transparent;
-        text-style: bold;
-    }
-    DataTable > .datatable--cursor {
-        background: $boost;
-    }
-    DataTable > .datatable--even-row {
-        background: transparent;
-    }
-    Footer {
-        background: transparent;
-        border-top: solid $primary;
-        height: 1;
-    }
-    Footer > .footer--key {
-        background: $primary;
-    }
-    #step-search-input {
-        border: none;
-        background: $boost;
-        height: 2;
-        margin: 0;
-        padding: 0 1;
-    }
-    #step-search-input:focus {
-        border: none;
-    }
-    """
+    CSS = _APP_CSS
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
-        Binding("tab,right", "focus_steps", "→ Steps", show=True),
-        Binding("escape,left", "focus_sessions", "← Sessions", show=True),
-        Binding("slash", "focus_search", "/ Search", show=True),
-        Binding("r", "refresh", "Refresh", show=True),
-        Binding("d", "diff", "Diff", show=True),
+        Binding("tab,right", "focus_steps", "Steps"),
+        Binding("escape,left", "focus_sessions", "Sessions"),
+        Binding("slash", "focus_search", "Search"),
+        Binding("r", "refresh", "Refresh"),
+        Binding("d", "diff", "Diff"),
+        Binding("enter", "open_step", "Open", show=False),
     ]
 
-    def __init__(self, store: SessionStore, initial_diff_session_id: str | None = None) -> None:
+    def __init__(
+        self,
+        store: SessionStore,
+        initial_diff_session_id: str | None = None,
+    ) -> None:
         super().__init__()
         self.store = store
         self.sessions: list[dict] = []
         self.steps: list[dict] = []
+        self.visible_steps: list[dict] = []
         self.agent = "unknown"
         self.selected_session_id: str | None = None
-        self.accent_name = _accent_from_env()
-        self.accent, self.accent_bold = ACCENT_STYLES[self.accent_name]
         self._initial_diff_session_id = initial_diff_session_id
 
     def compose(self) -> ComposeResult:
-        with Horizontal(id="hero"):
-            yield Static(id="hero-left")
-            yield Static(id="hero-right")
+        with Horizontal(id="topbar"):
+            yield Static(id="brand")
+            yield Static(id="stats-bar")
 
-        with Horizontal(id="split"):
-            with Vertical(id="session-pane"):
-                yield Static(id="session-pane-title", classes="pane-title")
+        with Horizontal(id="main"):
+            with Vertical(id="rail"):
+                yield Static(Text(" SESSIONS", style="bold #64748b"), classes="section-head")
                 yield ListView(id="session-list")
-                yield Static(id="session-meta", classes="subpanel")
+                yield Static(id="session-detail")
 
-            with Vertical(id="steps-pane"):
-                yield Static(id="steps-pane-title", classes="pane-title")
-                yield Input(placeholder="Search steps... (press '/')", id="step-search-input")
-                yield Static(id="steps-summary", classes="subpanel")
-                yield DataTable(id="steps-table", cursor_type="row",
-                                zebra_stripes=True, show_cursor=True)
-                yield Static(id="step-preview", classes="subpanel")
+            with Vertical(id="workspace"):
+                yield Static(id="timeline-head")
+                yield Static(id="chips")
+                yield Input(placeholder="  filter steps…  /", id="step-search-input")
+                yield DataTable(
+                    id="steps-table",
+                    cursor_type="row",
+                    zebra_stripes=True,
+                    show_cursor=True,
+                )
+                yield Static(id="preview")
 
         yield Footer()
 
-    def _sessions_title(self) -> Text:
-        t = Text()
-        t.append(" Sessions", style=self.accent_bold)
-        if self.sessions:
-            t.append(f"  {len(self.sessions)}", style="dim yellow")
-        return t
+    # ── render helpers ───────────────────────────────────────────────────────
 
-    def _steps_title(self, label: str = "Timeline", count: int = 0,
-                     sid: str = "") -> Text:
-        t = Text()
-        t.append(f" {label}", style=self.accent_bold)
-        if sid:
-            t.append(f"  {sid}", style="dim")
-        if count:
-            t.append(f"  {count} steps", style="dim yellow")
-        return t
-
-    def _header_title(self) -> Text:
-        active = sum(1 for session in self.sessions if _session_status(session) == "active")
-        agents = len({str(session.get("agent", "unknown")) for session in self.sessions}) if self.sessions else 0
+    def _brand_text(self) -> Text:
         repo = self.store.paths.repo_root.name or "."
-
         t = Text()
-        t.append("⬡ ", style=self.accent_bold)
-        t.append("MACH", style="bold white")
-        t.append("  execution ledger", style="dim")
-        t.append("   ", style="dim")
-        t.append(repo, style="bold")
-        t.append("  ", style="dim")
-        t.append(f"{active} active", style="green")
-        t.append("  ", style="dim")
-        t.append(f"{len(self.sessions)} sessions", style="cyan")
-        t.append("  ", style="dim")
-        t.append(f"{agents} agents", style="yellow")
+        t.append(" ⬡ ", style="bold #22d3ee")
+        t.append("MACH", style="bold #f8fafc")
+        t.append("  ledger", style="#64748b")
+        t.append("  ·  ", style="#334155")
+        t.append(repo, style="bold #e2e8f0")
         return t
 
-    def _header_meta(self) -> Text:
-        term_program = os.environ.get("TERM_PROGRAM", "terminal")
-        profile = (
-            os.environ.get("ITERM_PROFILE")
-            or os.environ.get("TERM_PROFILE")
-            or "terminal profile"
+    def _stats_text(self) -> Text:
+        active = sum(1 for s in self.sessions if _session_status(s) == "active")
+        agents = len({str(s.get("agent", "?")) for s in self.sessions}) if self.sessions else 0
+        t = Text()
+        t.append(" ● ", style="bold #34d399" if active else "#475569")
+        t.append(f"{active} live", style="#34d399" if active else "#64748b")
+        t.append("  ", style="")
+        t.append(f"{len(self.sessions)} sessions", style="#38bdf8")
+        t.append("  ", style="")
+        t.append(f"{agents} agents", style="#fbbf24")
+        t.append("  ", style="")
+        return t
+
+    def _session_card(self, s: dict) -> ListItem:
+        sid = _short_id(str(s.get("id", "")), "ses_", 8)
+        agent = str(s.get("agent", "?"))
+        branch = str(s.get("branch", "?"))
+        status = _session_status(s)
+        n_steps = s.get("step_count", 0) or 0
+        started = s.get("started_at", 0) or 0
+        is_active = status == "active"
+        acol = _agent_style(agent)
+        commit = _short_commit(s.get("post_commit") or s.get("pre_commit"))
+        risk = s.get("risk_count", 0) or 0
+        task = str(s.get("task_desc") or "").strip().replace("\n", " ")
+        if len(task) > 34:
+            task = task[:33] + "…"
+
+        line1 = Text()
+        line1.append("● " if is_active else "○ ", style="bold #34d399" if is_active else "#475569")
+        line1.append(sid, style="bold #f8fafc")
+        line1.append("  ", style="")
+        line1.append(commit, style="#fbbf24")
+
+        line2 = Text()
+        line2.append(f" {agent} ", style=f"bold #0b0f14 on {acol}")
+        line2.append("  ", style="")
+        line2.append(branch, style="#22d3ee")
+
+        line3 = Text()
+        line3.append(f"{n_steps} steps", style="#94a3b8")
+        line3.append(" · ", style="#334155")
+        line3.append(f"{_rel(started)} ago", style="#64748b")
+        if risk:
+            line3.append(" · ", style="#334155")
+            line3.append(f"⚠ {risk}", style="#f87171")
+        if is_active:
+            line3.append(" · ", style="#334155")
+            line3.append("LIVE", style="bold #34d399")
+
+        line4 = Text()
+        if task:
+            line4.append(task, style="#64748b")
+        else:
+            line4.append("no task description", style="#334155")
+
+        content = Text.assemble(line1, "\n", line2, "\n", line3, "\n", line4)
+        return ListItem(Static(content))
+
+    def _session_detail_text(self, session: dict | None) -> Text:
+        if not session:
+            return Text("Select a session to inspect metadata.", style="#64748b")
+
+        status = _session_status(session)
+        agent = str(session.get("agent", "unknown"))
+        acol = _agent_style(agent)
+        t = Text()
+        t.append("SELECTED\n", style="bold #64748b")
+        t.append(f"{agent.upper()} ", style=f"bold {acol}")
+        t.append(
+            "● active\n" if status == "active" else "○ ended\n",
+            style="bold #34d399" if status == "active" else "#64748b",
         )
-        t = Text()
-        t.append(term_program, style=self.accent_bold)
-        t.append("  ", style="dim")
-        t.append(profile, style="dim")
+        t.append("branch  ", style="#475569")
+        t.append(f"{session.get('branch', '?')}\n", style="#22d3ee")
+        t.append("commit  ", style="#475569")
+        t.append(_short_commit(session.get("pre_commit")), style="#fbbf24")
+        t.append(" → ", style="#334155")
+        post = _short_commit(session.get("post_commit"))
+        t.append(post if post != "—" else "pending", style="#34d399" if post != "—" else "#64748b")
+        t.append("\n")
+        t.append("risk    ", style="#475569")
+        risk = session.get("risk_count", 0) or 0
+        t.append(str(risk), style="#f87171" if risk else "#34d399")
+        t.append("\n")
+        task = str(session.get("task_desc") or "—").strip().replace("\n", " ")
+        if len(task) > 80:
+            task = task[:79] + "…"
+        t.append("task    ", style="#475569")
+        t.append(task, style="#e2e8f0")
         return t
 
-    def _session_meta_text(self, session: dict | None) -> Text:
-        if not session:
-            return Text("Pick a session to inspect its branch, commit range, and activity profile.", style="dim")
-
-        status = _session_status(session)
-        started = session.get("started_at", 0) or 0
-        ended = session.get("ended_at", 0) or 0
-        risk_count = session.get("risk_count", 0) or 0
-        branch = str(session.get("branch", "?"))
-        task = session.get("task_desc") or "No task description recorded."
-        pre_commit = _short_commit(session.get("pre_commit"))
-        post_commit = _short_commit(session.get("post_commit"))
-
+    def _timeline_head(self, sid: str = "", count: int = 0) -> Text:
         t = Text()
-        t.append("Selected session\n", style=self.accent_bold)
-        t.append(f"{str(session.get('agent', 'unknown')).upper()} ", style=f"bold {AGENT_COLOR.get(str(session.get('agent', '')).lower(), 'white')}")
-        t.append(f"{status}", style="bold green" if status == "active" else "dim")
-        t.append(f"  on {branch}\n", style="cyan")
-        t.append("Started  ", style="dim")
-        t.append(_abs_ts(started), style="white")
-        if ended:
-            t.append("\nEnded    ", style="dim")
-            t.append(_abs_ts(ended), style="white")
-        t.append("\nCommits  ", style="dim")
-        t.append(pre_commit, style="yellow")
-        t.append(" -> ", style="dim")
-        t.append(post_commit if post_commit != "?" else "pending", style="green" if post_commit != "?" else "dim")
-        t.append("\nRisk     ", style="dim")
-        t.append(str(risk_count), style="red" if risk_count else "green")
-        t.append("\nTask     ", style="dim")
-        t.append(str(task), style="white")
+        t.append(" TIMELINE", style="bold #64748b")
+        if sid:
+            t.append(f"  {sid}", style="#60a5fa")
+        if count:
+            t.append(f"  ·  {count} events", style="#94a3b8")
         return t
 
-    def _steps_summary_text(self, session: dict | None, steps: list[dict]) -> Text:
+    def _chips_text(self, session: dict | None, steps: list[dict]) -> Text:
         if not session:
-            return Text("No session selected.", style="dim")
-
+            return Text("  —", style="#475569")
         counts = Counter(step.get("type", "unknown") for step in steps)
-        tool_calls = sum(step.get("count", 1) for step in steps if step.get("type") == "tool")
-        file_events = sum(_count_file_changes(step) for step in steps)
-        status = _session_status(session)
-
+        tools = sum(step.get("count", 1) for step in steps if step.get("type") == "tool")
+        files = sum(_count_file_changes(step) for step in steps)
+        risks = sum(len(step.get("risk_flags") or []) for step in steps)
         t = Text()
-        t.append("Overview  ", style=self.accent_bold)
-        t.append(status, style="green" if status == "active" else "dim")
-        t.append("   ")
-        t.append(f"{counts.get('input', 0)} in", style="green")
-        t.append("   ")
-        t.append(f"{counts.get('reasoning', 0)} think", style="magenta")
-        t.append("   ")
-        t.append(f"{tool_calls} tools", style="yellow")
-        t.append("   ")
-        t.append(f"{counts.get('output', 0)} out", style="cyan")
-        t.append("   ")
-        t.append(f"{file_events} file events", style="blue")
+        t.append("  ", style="")
+        t.append(f" {counts.get('input', 0)} in ", style="bold #0b0f14 on #34d399")
+        t.append(" ", style="")
+        t.append(f" {counts.get('reasoning', 0)} think ", style="bold #0b0f14 on #c084fc")
+        t.append(" ", style="")
+        t.append(f" {tools} tools ", style="bold #0b0f14 on #fbbf24")
+        t.append(" ", style="")
+        t.append(f" {counts.get('output', 0)} out ", style="bold #0b0f14 on #38bdf8")
+        t.append(" ", style="")
+        t.append(f" {files} files ", style="bold #0b0f14 on #64748b")
+        if risks:
+            t.append(" ", style="")
+            t.append(f" {risks} risk ", style="bold #0b0f14 on #f87171")
         return t
 
-    def _step_preview_text(self, step: dict | None) -> Text:
+    def _preview_block(self, step: dict | None) -> Text:
         if not step:
-            return Text("Move through the timeline to preview the selected step here. Press Enter for the full detail view.", style="dim")
-
+            return Text(
+                "\n  Navigate the timeline · Enter opens full detail · / filters\n",
+                style="#64748b",
+            )
         stype = step.get("type", "unknown")
         icon, ic = STEP_ICON.get(stype, ("·", "dim"))
         t = Text()
+        t.append("\n  ", style="")
         t.append(f"{icon} ", style=ic)
         t.append(f"{stype.upper()}  ", style=ic)
-        t.append(_preview_text(step), style="white")
+        t.append(_preview_text(step, 90), style="#e2e8f0")
+        t.append("\n  ", style="")
         if stype == "tool":
-            count = step.get("count", 1)
-            category = step.get("category", "exec")
+            t.append(f"[{step.get('category', 'exec')}]", style="#64748b")
             files = _count_file_changes(step)
-            t.append("  ", style="dim")
-            t.append(f"[{category}]", style="dim")
-            if count > 1:
-                t.append(f"  x{count}", style="yellow")
             if files:
-                t.append(f"  {files} file changes", style="blue")
+                t.append(f"  {files} file change(s)", style="#38bdf8")
+            risk = step.get("risk_level") or "none"
+            if risk != "none":
+                t.append(f"  risk:{risk}", style="#f87171")
+        t.append("   ⏎ detail", style="#475569")
         return t
+
+    # ── lifecycle ────────────────────────────────────────────────────────────
 
     def on_mount(self) -> None:
         tt = self.query_one("#steps-table", DataTable)
-        tt.add_columns(" ", "Event", "Summary", "Files", "When")
+        tt.add_columns(" ", "Type", "Summary", "Files", "When")
         self._load_sessions()
-        self._refresh_header()
         self.query_one("#session-list", ListView).focus()
         if self._initial_diff_session_id:
             self.set_timer(0.05, self._open_initial_diff)
@@ -845,7 +979,6 @@ class MachApp(App):
         sid = self._initial_diff_session_id
         if not sid:
             return
-        # Select matching session in the list so focus is correct
         for i, s in enumerate(self.sessions):
             if s.get("id") == sid:
                 lv = self.query_one("#session-list", ListView)
@@ -854,86 +987,48 @@ class MachApp(App):
                 break
         self.push_screen(DiffScreen(sid, self.store))
 
-    def _refresh_header(self) -> None:
-        self.query_one("#hero-left", Static).update(self._header_title())
-        self.query_one("#hero-right", Static).update(self._header_meta())
-
     def _load_sessions(self) -> None:
         self.sessions = self.store.list_sessions()
         lv = self.query_one("#session-list", ListView)
         lv.clear()
         for s in self.sessions:
-            lv.append(self._make_session_item(s))
-        self.query_one("#session-pane-title", Static).update(self._sessions_title())
-        self._refresh_header()
+            lv.append(self._session_card(s))
+
+        self.query_one("#brand", Static).update(self._brand_text())
+        self.query_one("#stats-bar", Static).update(self._stats_text())
+
         if self.sessions:
             self.selected_session_id = self.sessions[0].get("id")
             self._load_steps(self.sessions[0])
         else:
             self.steps = []
+            self.visible_steps = []
             self.selected_session_id = None
-            self.query_one("#steps-pane-title", Static).update(self._steps_title())
-            self.query_one("#session-meta", Static).update(self._session_meta_text(None))
-            self.query_one("#steps-summary", Static).update(self._steps_summary_text(None, []))
-            self.query_one("#step-preview", Static).update(self._step_preview_text(None))
-
-    def _make_session_item(self, s: dict) -> ListItem:
-        sid = _short_id(str(s.get("id", "")), "ses_", size=10)
-        agent = str(s.get("agent", "?"))
-        branch = str(s.get("branch", "?"))
-        status = _session_status(s)
-        n_steps = s.get("step_count", 0)
-        started = s.get("started_at", 0)
-        is_active = status == "active"
-        acol = AGENT_COLOR.get(agent.lower(), "white")
-        commit = _short_commit(s.get("post_commit") or s.get("pre_commit"))
-        risk = s.get("risk_count", 0) or 0
-
-        line1 = Text()
-        line1.append("● " if is_active else "○ ", style="bold green" if is_active else "dim")
-        line1.append(sid, style="bold white")
-        line1.append("  ", style="dim")
-        line1.append(commit, style="yellow")
-
-        line2 = Text()
-        line2.append(agent, style=f"bold {acol}")
-        line2.append("  on ", style="dim")
-        line2.append(branch, style="cyan")
-
-        line3 = Text()
-        line3.append(f"{n_steps} steps", style="dim")
-        line3.append("  ·  ", style="dim")
-        line3.append(_rel(started), style="dim")
-        if risk:
-            line3.append("  ·  ", style="dim")
-            line3.append(f"{risk} risk", style="red")
-
-        line4 = Text("active now" if is_active else "completed", style="green" if is_active else "dim")
-
-        content = Text.assemble(line1, "\n", line2, "\n", line3, "\n", line4)
-        return ListItem(Static(content))
+            self.query_one("#timeline-head", Static).update(self._timeline_head())
+            self.query_one("#chips", Static).update(self._chips_text(None, []))
+            self.query_one("#session-detail", Static).update(self._session_detail_text(None))
+            self.query_one("#preview", Static).update(self._preview_block(None))
+            self.query_one("#steps-table", DataTable).clear()
 
     def _load_steps(self, session: dict) -> None:
         sid = session.get("id", "")
         self.agent = str(session.get("agent", "unknown"))
         self.selected_session_id = sid
+        meta = session
         try:
             data = self.store.show_session(sid)
             self.steps = _coalesce(data["steps"])
+            meta = data.get("meta") or session
         except Exception:
             self.steps = []
 
-        tt = self.query_one("#steps-table", DataTable)
-        tt.clear()
-
         short_id = _short_id(sid, "ses_")
-        self.query_one("#steps-pane-title", Static).update(
-            self._steps_title(label="Timeline", sid=short_id, count=len(self.steps))
+        self.query_one("#timeline-head", Static).update(
+            self._timeline_head(sid=short_id, count=len(self.steps))
         )
-        self.query_one("#session-meta", Static).update(self._session_meta_text(data["meta"] if "data" in locals() else session))
-        self.query_one("#steps-summary", Static).update(self._steps_summary_text(data["meta"] if "data" in locals() else session, self.steps))
+        self.query_one("#session-detail", Static).update(self._session_detail_text(meta))
+        self.query_one("#chips", Static).update(self._chips_text(meta, self.steps))
 
-        # Clear search input on new session
         search_input = self.query_one("#step-search-input", Input)
         search_input.value = ""
         self._populate_table()
@@ -941,58 +1036,70 @@ class MachApp(App):
     def _populate_table(self, query: str = "") -> None:
         tt = self.query_one("#steps-table", DataTable)
         tt.clear()
-        
-        q = query.lower().strip()
-        visible_steps = []
 
+        q = query.lower().strip()
+        visible: list[dict] = []
         for step in self.steps:
             stype = step.get("type", "unknown")
             content = str(step.get("content") or "").lower()
-            tool_content = str(step.get("tool", {}).get("content") or "").lower()
-            name = str(step.get("tool", {}).get("name") or "").lower()
-
-            if q and q not in content and q not in tool_content and q not in name and q not in stype:
+            name = str(step.get("name") or "").lower()
+            if q and q not in content and q not in name and q not in stype:
                 continue
-            
-            visible_steps.append(step)
+            visible.append(step)
 
-        self.query_one("#steps-pane-title", Static).update(
-            self._steps_title(label="Timeline", sid=_short_id(self.selected_session_id or "", "ses_"), count=len(visible_steps))
+        self.visible_steps = visible
+        self.query_one("#timeline-head", Static).update(
+            self._timeline_head(
+                sid=_short_id(self.selected_session_id or "", "ses_"),
+                count=len(visible),
+            )
         )
 
-        for step in visible_steps:
+        for step in visible:
             stype = step.get("type", "unknown")
             icon, ic = STEP_ICON.get(stype, ("·", "dim"))
             ts = step.get("ts", 0)
 
             icon_cell = Text(icon, style=ic)
-            label_cell = Text(stype.upper(), style=ic + " bold" if "bold" not in ic else ic)
+            label_cell = Text(stype[:6].upper(), style=ic)
 
             if stype == "tool":
                 count = step.get("count", 1)
                 cat = step.get("category", "exec")
                 ci = TOOL_CAT_ICON.get(cat, "·")
                 detail = Text()
-                detail.append(f"{ci} ", style="yellow")
-                detail.append(step.get("name", "?"), style="bold yellow")
+                detail.append(f"{ci} ", style="#fbbf24")
+                detail.append(str(step.get("name", "?")), style="bold #fbbf24")
                 tool_content = _strip(step.get("content") or "").strip().replace("\n", " ")
                 if tool_content:
-                    detail.append("  ", style="dim")
-                    detail.append(tool_content[:76] + "…" if len(tool_content) > 76 else tool_content, style="dim")
+                    detail.append("  ", style="")
+                    clipped = tool_content[:70] + "…" if len(tool_content) > 70 else tool_content
+                    detail.append(clipped, style="#64748b")
                 if count > 1:
-                    detail.append(f"  x{count}", style="bold yellow")
+                    detail.append(f"  ×{count}", style="#fbbf24")
             else:
                 raw = _strip(step.get("content") or "").strip().replace("\n", " ")
                 if not raw:
-                    detail = Text("(redacted)", style="dim italic")
+                    detail = Text("(empty)", style="italic #475569")
                 else:
-                    detail = Text(raw[:120] + "…" if len(raw) > 120 else raw)
+                    detail = Text(
+                        raw[:110] + "…" if len(raw) > 110 else raw,
+                        style="#e2e8f0",
+                    )
 
-            files_cell = Text(str(_count_file_changes(step)) if _count_file_changes(step) else "·", style="blue" if _count_file_changes(step) else "dim")
-            ts_cell = Text(_abs_ts(ts), style="dim") if ts else Text("")
+            n_files = _count_file_changes(step)
+            files_cell = Text(
+                str(n_files) if n_files else "·",
+                style="#38bdf8" if n_files else "#334155",
+            )
+            ts_cell = Text(_rel(ts) if ts else "", style="#64748b")
             tt.add_row(icon_cell, label_cell, detail, files_cell, ts_cell)
 
-        self.query_one("#step-preview", Static).update(self._step_preview_text(visible_steps[0] if visible_steps else None))
+        self.query_one("#preview", Static).update(
+            self._preview_block(visible[0] if visible else None)
+        )
+
+    # ── events ───────────────────────────────────────────────────────────────
 
     @on(Input.Changed, "#step-search-input")
     def on_search_changed(self, event: Input.Changed) -> None:
@@ -1013,14 +1120,14 @@ class MachApp(App):
     @on(DataTable.RowHighlighted, "#steps-table")
     def on_step_highlighted(self, event: DataTable.RowHighlighted) -> None:
         row = event.cursor_row
-        if row is not None and 0 <= row < len(self.steps):
-            self.query_one("#step-preview", Static).update(self._step_preview_text(self.steps[row]))
+        if row is not None and 0 <= row < len(self.visible_steps):
+            self.query_one("#preview", Static).update(self._preview_block(self.visible_steps[row]))
 
     @on(DataTable.RowSelected, "#steps-table")
     def on_step_selected(self, event: DataTable.RowSelected) -> None:
         row = event.cursor_row
-        if row is not None and 0 <= row < len(self.steps):
-            self.push_screen(StepDetail(self.steps[row], self.agent))
+        if row is not None and 0 <= row < len(self.visible_steps):
+            self.push_screen(StepDetail(self.visible_steps[row], self.agent))
 
     def action_focus_steps(self) -> None:
         self.query_one("#steps-table", DataTable).focus()
@@ -1033,24 +1140,27 @@ class MachApp(App):
 
     def action_refresh(self) -> None:
         self._load_sessions()
-        self.notify("Sessions refreshed", severity="information", timeout=2)
+        self.notify("Refreshed", severity="information", timeout=1.5)
 
     def action_diff(self) -> None:
         if self.selected_session_id:
             self.push_screen(DiffScreen(self.selected_session_id, self.store))
 
+    def action_open_step(self) -> None:
+        table = self.query_one("#steps-table", DataTable)
+        if not table.has_focus:
+            return
+        row = table.cursor_row
+        if row is not None and 0 <= row < len(self.visible_steps):
+            self.push_screen(StepDetail(self.visible_steps[row], self.agent))
+
 
 class DiffOnlyApp(App):
-    """Standalone TUI app that shows only the diff screen for a session."""
+    """Standalone TUI for session diff."""
 
     TITLE = "mach diff"
+    CSS = _APP_CSS
     BINDINGS = [Binding("q,escape", "quit", "Quit")]
-
-    DEFAULT_CSS = """
-    Screen {
-        background: $background;
-    }
-    """
 
     def __init__(self, store: SessionStore, session_id: str) -> None:
         super().__init__()
