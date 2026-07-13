@@ -348,28 +348,28 @@ Footer > .footer--key {{
 }}
 Footer > .footer--description {{ color: $dim; }}
 
-/* modal */
+/* step detail modal */
 StepDetail {{
     align: center middle;
     background: #000000 60%;
 }}
-#modal {{
+#step-detail-shell {{
     width: 88%;
     height: 84%;
     background: $surface;
     border: solid $border;
 }}
-#modal-h {{
+#step-detail-h {{
     height: auto;
     padding: 1 2;
     border-bottom: solid $border;
 }}
-#modal-b {{
+#step-detail-b {{
     height: 1fr;
     padding: 1 2;
     scrollbar-color: $border;
 }}
-#modal-f {{
+#step-detail-f {{
     height: 1;
     padding: 0 2;
     border-top: solid $border;
@@ -430,34 +430,21 @@ class StepDetail(ModalScreen[None]):
         label = STEP_LABEL.get(stype, stype)
         ts = s.get("ts", 0)
 
-        with Vertical(id="modal"):
-            h = Text()
-            h.append(f"{glyph} ", style=ACCENT)
-            h.append(label, style=f"bold {FG}")
-            h.append("  ", style="")
-            h.append(_short_id(str(s.get("id", "")), "step_", 14), style=MUTED)
-            h.append("  ·  ", style=DIM)
-            h.append(self.agent, style=MUTED)
-            if ts:
-                h.append(f"  ·  {_abs_ts(ts)}", style=DIM)
-            if s.get("commit_hash"):
-                h.append(f"  ·  {_short_commit(s.get('commit_hash'))}", style=DIM)
-            yield Static(h, id="modal-h")
+        h = Text()
+        h.append(f"{glyph} ", style=ACCENT)
+        h.append(label, style=f"bold {FG}")
+        h.append("  ", style="")
+        h.append(_short_id(str(s.get("id", "")), "step_", 14), style=MUTED)
+        h.append("  ·  ", style=DIM)
+        h.append(self.agent, style=MUTED)
+        if ts:
+            h.append(f"  ·  {_abs_ts(ts)}", style=DIM)
+        if s.get("commit_hash"):
+            h.append(f"  ·  {_short_commit(s.get('commit_hash'))}", style=DIM)
 
-            with VerticalScroll(id="modal-b"):
-                # meta block
-                m = Text()
-                m.append("session  ", style=DIM)
-                m.append(_short_id(str(self.session.get("id", "")), "ses_", 10), style=MUTED)
-                m.append("  parent  ", style=DIM)
-                parent = s.get("parent_step_id")
-                m.append(_short_id(str(parent), "step_", 10) if parent else "—", style=MUTED)
-                risk = s.get("risk_level") or "none"
-                m.append("  risk  ", style=DIM)
-                m.append(str(risk), style=DANGER if risk != "none" else MUTED)
-                yield Static(m)
-                yield Static(Text(""))
+        body_widgets: list = []
 
+<<<<<<< Updated upstream
         with Vertical(id="modal"):
             h = Text()
             h.append(f"{glyph} ", style=ACCENT)
@@ -479,55 +466,85 @@ class StepDetail(ModalScreen[None]):
                         t.append(f"  ×{s['count']}", style=MUTED)
                     yield Static(t)
                     yield Static(Text(""))
+=======
+        m = Text()
+        m.append("session  ", style=DIM)
+        m.append(_short_id(str(self.session.get("id", "")), "ses_", 10), style=MUTED)
+        m.append("  parent  ", style=DIM)
+        parent = s.get("parent_step_id")
+        m.append(_short_id(str(parent), "step_", 10) if parent else "—", style=MUTED)
+        risk = s.get("risk_level") or "none"
+        m.append("  risk  ", style=DIM)
+        m.append(str(risk), style=DANGER if risk != "none" else MUTED)
+        body_widgets.append(Static(m))
+        body_widgets.append(Static(Text("")))
+>>>>>>> Stashed changes
 
-                content = _strip(s.get("content") or "").strip()
-                yield Static(Text("content", style=DIM))
-                if content:
-                    for line in content.splitlines():
-                        yield Static(Text(line, style=FG))
-                else:
-                    yield Static(Text("—", style=DIM))
+        if stype == "tool":
+            t = Text()
+            t.append(str(s.get("name", "?")), style=f"bold {FG}")
+            t.append(f"  ·  {s.get('category', 'exec')}", style=MUTED)
+            if s.get("count", 1) > 1:
+                t.append(f"  ×{s['count']}", style=MUTED)
+            body_widgets.append(Static(t))
+            body_widgets.append(Static(Text("")))
 
-                fc = s.get("file_changes") or []
-                if fc:
-                    yield Static(Text(""))
-                    yield Static(Text(f"files  {len(fc)}", style=DIM))
-                    for ch in fc:
-                        action = ch.get("action", "write")
-                        fp = ch.get("file_path", "?")
-                        added = ch.get("lines_added", 0) or 0
-                        removed = ch.get("lines_removed", 0) or 0
-                        line = Text()
-                        line.append(f"{action:<6} ", style=MUTED)
-                        line.append(str(fp), style=FG)
-                        if added or removed:
-                            line.append(f"  +{added}", style=OK if added else DIM)
-                            line.append(f" -{removed}", style=DANGER if removed else DIM)
-                        yield Static(line)
-                        for hunk in ch.get("hunks", []):
-                            hs, he = hunk.get("from", 0), hunk.get("to", 0)
-                            yield Static(
-                                Text(
-                                    f"       @@ -{hs},{max(1, he - hs + 1)} +{hs},{max(1, he - hs + 1)} @@",
-                                    style=DIM,
-                                )
+        content = _strip(s.get("content") or "").strip()
+        body_widgets.append(Static(Text("content", style=DIM)))
+        if content:
+            for line in content.splitlines():
+                body_widgets.append(Static(Text(line, style=FG)))
+        else:
+            body_widgets.append(Static(Text("—", style=DIM)))
+
+        fc = s.get("file_changes") or []
+        if fc:
+            body_widgets.append(Static(Text("")))
+            body_widgets.append(Static(Text(f"files  {len(fc)}", style=DIM)))
+            for ch in fc:
+                action = ch.get("action", "write")
+                fp = ch.get("file_path", "?")
+                added = ch.get("lines_added", 0) or 0
+                removed = ch.get("lines_removed", 0) or 0
+                line = Text()
+                line.append(f"{action:<6} ", style=MUTED)
+                line.append(str(fp), style=FG)
+                if added or removed:
+                    line.append(f"  +{added}", style=OK if added else DIM)
+                    line.append(f" -{removed}", style=DANGER if removed else DIM)
+                body_widgets.append(Static(line))
+                for hunk in ch.get("hunks", []):
+                    hs, he = hunk.get("from", 0), hunk.get("to", 0)
+                    body_widgets.append(
+                        Static(
+                            Text(
+                                f"       @@ -{hs},{max(1, he - hs + 1)} +{hs},{max(1, he - hs + 1)} @@",
+                                style=DIM,
                             )
+                        )
+                    )
 
-                flags = s.get("risk_flags") or []
-                if flags:
-                    yield Static(Text(""))
-                    yield Static(Text(f"risk flags  {len(flags)}", style=DIM))
-                    for flag in flags:
-                        if not isinstance(flag, dict):
-                            continue
-                        rl = Text()
-                        rl.append(f"{str(flag.get('severity', '?')):<8} ", style=DANGER)
-                        rl.append(str(flag.get("rule_id", "?")), style=FG)
-                        if flag.get("explanation"):
-                            rl.append(f"  {flag['explanation']}", style=MUTED)
-                        yield Static(rl)
+        flags = s.get("risk_flags") or []
+        if flags:
+            body_widgets.append(Static(Text("")))
+            body_widgets.append(Static(Text(f"risk flags  {len(flags)}", style=DIM)))
+            for flag in flags:
+                if not isinstance(flag, dict):
+                    continue
+                rl = Text()
+                rl.append(f"{str(flag.get('severity', '?')):<8} ", style=DANGER)
+                rl.append(str(flag.get("rule_id", "?")), style=FG)
+                if flag.get("explanation"):
+                    rl.append(f"  {flag['explanation']}", style=MUTED)
+                body_widgets.append(Static(rl))
 
-            yield Static(Text("esc close", style=DIM), id="modal-f")
+        # Single explicit tree — avoids duplicate context-manager mounts on ModalScreen.
+        yield Vertical(
+            Static(h, id="step-detail-h"),
+            VerticalScroll(*body_widgets, id="step-detail-b"),
+            Static(Text("esc close", style=DIM), id="step-detail-f"),
+            id="step-detail-shell",
+        )
 
 
 # ══════════════════════════════════════════════════════════
