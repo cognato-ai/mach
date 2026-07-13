@@ -281,7 +281,7 @@ ListItem:hover {{ background: $panel; }}
 }}
 #filter {{
     height: 1;
-    background: $surface;
+    background: $bg;
     border: none;
     border-bottom: solid $border;
     padding: 0 1;
@@ -389,6 +389,7 @@ DiffScreen {{ background: $bg; }}
 #diff-l {{
     width: 40%;
     height: 1fr;
+    border-right: solid $border;
     background: $surface;
     border-right: solid $border;
 }}
@@ -457,6 +458,19 @@ class StepDetail(ModalScreen[None]):
                 yield Static(m)
                 yield Static(Text(""))
 
+        with Vertical(id="modal"):
+            h = Text()
+            h.append(f"{glyph} ", style=ACCENT)
+            h.append(label, style=f"bold {FG}")
+            h.append("  ", style="")
+            h.append(_short_id(str(s.get("id", "")), "step_", 12), style=MUTED)
+            h.append("  ·  ", style=DIM)
+            h.append(self.agent, style=MUTED)
+            if ts:
+                h.append(f"  ·  {_abs_ts(ts)}", style=DIM)
+            yield Static(h, id="modal-h")
+
+            with VerticalScroll(id="modal-b"):
                 if stype == "tool":
                     t = Text()
                     t.append(str(s.get("name", "?")), style=f"bold {FG}")
