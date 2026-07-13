@@ -444,29 +444,6 @@ class StepDetail(ModalScreen[None]):
 
         body_widgets: list = []
 
-<<<<<<< Updated upstream
-        with Vertical(id="modal"):
-            h = Text()
-            h.append(f"{glyph} ", style=ACCENT)
-            h.append(label, style=f"bold {FG}")
-            h.append("  ", style="")
-            h.append(_short_id(str(s.get("id", "")), "step_", 12), style=MUTED)
-            h.append("  ·  ", style=DIM)
-            h.append(self.agent, style=MUTED)
-            if ts:
-                h.append(f"  ·  {_abs_ts(ts)}", style=DIM)
-            yield Static(h, id="modal-h")
-
-            with VerticalScroll(id="modal-b"):
-                if stype == "tool":
-                    t = Text()
-                    t.append(str(s.get("name", "?")), style=f"bold {FG}")
-                    t.append(f"  ·  {s.get('category', 'exec')}", style=MUTED)
-                    if s.get("count", 1) > 1:
-                        t.append(f"  ×{s['count']}", style=MUTED)
-                    yield Static(t)
-                    yield Static(Text(""))
-=======
         m = Text()
         m.append("session  ", style=DIM)
         m.append(_short_id(str(self.session.get("id", "")), "ses_", 10), style=MUTED)
@@ -478,7 +455,6 @@ class StepDetail(ModalScreen[None]):
         m.append(str(risk), style=DANGER if risk != "none" else MUTED)
         body_widgets.append(Static(m))
         body_widgets.append(Static(Text("")))
->>>>>>> Stashed changes
 
         if stype == "tool":
             t = Text()
